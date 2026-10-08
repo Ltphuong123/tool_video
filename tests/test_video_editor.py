@@ -10,12 +10,76 @@ import numpy as np
 import soundfile as sf
 
 from apps.video_editor import (
-    _audio_windows, _guard_reader_cleanup, _write_ramped_audio, build_speed_time_map,
-    probe_video, render_speed_segment, require_moviepy,
+    SpeedSegment, _audio_windows, _guard_reader_cleanup, _write_ramped_audio,
+    build_multi_speed_time_map, build_speed_time_map, probe_video,
+    render_speed_segment, render_speed_segments, require_moviepy,
 )
 
 
 class SpeedTimeMapTests(unittest.TestCase):
+    def test_multiple_ranges_sort_and_preserve_every_gap_at_one_x(self):
+        mapping = build_multi_speed_time_map(
+            10, [SpeedSegment(6, 8, 0.5, 0), SpeedSegment(1, 3, 2, 0)],
+        )
+        self.assertEqual(mapping.segments, (SpeedSegment(1, 3, 2, 0), SpeedSegment(6, 8, 0.5, 0)))
+        self.assertEqual(mapping.output_duration, 11)
+        source = [0, 1, 2, 3, 4, 6, 7, 8, 10]
+        output = [0, 1, 1.5, 2, 3, 5, 7, 9, 11]
+        np.testing.assert_array_equal(mapping.output_time(source), output)
+        np.testing.assert_array_equal(mapping.source_time(output), source)
+
+    def test_multiple_ramps_compose_their_durations_and_remain_reversible(self):
+        segments = (SpeedSegment(2, 5, 4, 0.6), SpeedSegment(7, 9, 0.25, 0.4),
+                    SpeedSegment(9, 11, 1.6, 0.2))
+        mapping = build_multi_speed_time_map(15, segments)
+        expected = 15 + sum(build_speed_time_map(15, segment.start, segment.end,
+                                                segment.speed, segment.ramp_seconds).output_duration - 15
+                            for segment in segments)
+        self.assertAlmostEqual(mapping.output_duration, expected, places=12)
+        self.assertTrue(np.all(np.diff(mapping.source_knots) > 0))
+        self.assertTrue(np.all(np.diff(mapping.output_knots) > 0))
+        times = np.linspace(0, 15, 4001)
+        np.testing.assert_allclose(mapping.source_time(mapping.output_time(times)), times, atol=1e-12)
+        for begin, end in ((0, 2), (5, 7), (11, 15)):
+            self.assertAlmostEqual(mapping.output_time(end) - mapping.output_time(begin), end - begin)
+        with self.assertRaises(ValueError):
+            mapping.output_knots[0] = 1
+
+    def test_empty_and_one_x_multiple_ranges_leave_timeline_unchanged(self):
+        for segments in ([], [SpeedSegment(1, 3, 1, 0.5), SpeedSegment(5, 8, 1, 1)]):
+            with self.subTest(segments=segments):
+                mapping = build_multi_speed_time_map(10, segments)
+                np.testing.assert_array_equal(mapping.output_time(np.arange(11)), np.arange(11))
+                self.assertEqual(mapping.output_duration, 10)
+
+    def test_multiple_ranges_reject_overlap_and_invalid_values(self):
+        invalid = ([SpeedSegment(1, 4), SpeedSegment(3, 5)],
+                   [SpeedSegment(1, 4), SpeedSegment(1, 4)],
+                   [SpeedSegment(-1, 2)], [SpeedSegment(1, 11)],
+                   [SpeedSegment(2, 2)], [SpeedSegment(math.nan, 4)],
+                   [SpeedSegment(1, math.inf)], [SpeedSegment(1, 3, math.nan)],
+                   [SpeedSegment(1, 3, 4.1)], [SpeedSegment(1, 3, 1.5, math.inf)],
+                   [SpeedSegment(1, 3, 1.5, 1.1)], [(1, 3, 1.5, 0.5)])
+        for segments in invalid:
+            with self.subTest(segments=segments), self.assertRaises(ValueError):
+                build_multi_speed_time_map(10, segments)
+        for duration in (0, -1, math.nan, math.inf):
+            with self.subTest(duration=duration), self.assertRaises(ValueError):
+                build_multi_speed_time_map(duration, [])
+
+    def test_multi_audio_windows_cover_adjacent_ranges_and_gaps_without_holes(self):
+        mapping = build_multi_speed_time_map(
+            300, [SpeedSegment(20, 80, 4, 0.5), SpeedSegment(80, 110, 0.25, 0.3),
+                  SpeedSegment(150, 230, 1.5, 0.4)],
+        )
+        windows = list(_audio_windows(mapping))
+        self.assertEqual(windows[0][0], 0)
+        self.assertEqual(windows[-1][1], 300)
+        self.assertLessEqual(max(end - begin for begin, end in windows), 4)
+        for current, following in zip(windows[:-1], windows[1:]):
+            self.assertEqual(current[1], following[0])
+        self.assertLess(mapping.source_knots.nbytes + mapping.output_knots.nbytes, 100000)
+
     def test_constant_speed_changes_only_selected_range(self):
         mapping = build_speed_time_map(120, 10, 30, 2, 0)
         self.assertEqual(mapping.output_duration, 110)
@@ -119,6 +183,62 @@ class SpeedTimeMapTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("pedalboard"), "optional pedalboard not installed")
 class VideoAudioTests(unittest.TestCase):
+    def test_multi_rubberband_audio_preserves_pitch_and_untouched_middle_gap(self):
+        class SineAudio:
+            nchannels = 2
+            duration = 6
+
+            def get_frame(self, times):
+                return np.column_stack((0.2 * np.sin(2 * np.pi * 220 * times),
+                                        0.1 * np.sin(2 * np.pi * 440 * times)))
+
+        mapping = build_multi_speed_time_map(
+            6, [SpeedSegment(1, 2.5, 2, 0.25), SpeedSegment(4, 5.5, 0.5, 0.25)],
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "multi.wav"
+            _write_ramped_audio(SineAudio(), path, mapping)
+            audio, rate = sf.read(path, dtype="float32", always_2d=True)
+            self.assertEqual(audio.shape, (round(mapping.output_duration * rate), 2))
+            # The middle gap is copied at 1x using the new absolute offset.
+            begin = round(float(mapping.output_time(3)) * rate)
+            count = rate // 2
+            expected = SineAudio().get_frame(np.arange(3 * rate, 3 * rate + count) / rate).astype(np.float32)
+            np.testing.assert_allclose(audio[begin:begin + count], expected, atol=1e-7)
+            for source_begin, source_end in ((1.5, 2), (4.5, 5)):
+                first = round(float(mapping.output_time(source_begin)) * rate)
+                last = round(float(mapping.output_time(source_end)) * rate)
+                for channel, expected_pitch in ((0, 220), (1, 440)):
+                    section = audio[first:last, channel]
+                    spectrum = np.abs(np.fft.rfft(section * np.hanning(len(section))))
+                    pitch = np.fft.rfftfreq(len(section), 1 / rate)[spectrum.argmax()]
+                    self.assertAlmostEqual(pitch, expected_pitch, delta=3)
+
+    def test_transients_in_multiple_ramps_and_gaps_follow_video_time(self):
+        class PulseAudio:
+            nchannels = 1
+            duration = 8
+
+            def __init__(self, center):
+                self.center = center
+
+            def get_frame(self, times):
+                envelope = np.exp(-((times - self.center) / 0.014) ** 2)
+                return (0.3 * envelope * np.sin(2 * np.pi * 400 * times))[:, None]
+
+        mapping = build_multi_speed_time_map(
+            8, [SpeedSegment(1, 3, 0.5, 0.4), SpeedSegment(5, 7, 2, 0.4)],
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pulses.wav"
+            for center in (0.8, 1.15, 2.2, 3.5, 4.4, 5.15, 6.1, 7.5):
+                with self.subTest(center=center):
+                    _write_ramped_audio(PulseAudio(center), path, mapping)
+                    audio, rate = sf.read(path, dtype="float32")
+                    self.assertEqual(len(audio), round(mapping.output_duration * rate))
+                    actual = np.argmax(np.abs(audio)) / rate
+                    self.assertAlmostEqual(actual, mapping.output_time(center), delta=1 / 30)
+
     def test_rubberband_audio_is_stereo_pitch_preserving_and_exact_length(self):
         class SineAudio:
             nchannels = 2
@@ -209,6 +329,60 @@ class MoviePyRenderTests(unittest.TestCase):
 
     def tearDown(self):
         self.folder.cleanup()
+
+    def test_real_multi_render_keeps_audio_fps_and_frames_in_middle_gap(self):
+        from moviepy import VideoFileClip
+        output = self.directory / "multiple.mp4"
+        segments = [SpeedSegment(0.2, 0.7, 2, 0.1), SpeedSegment(1.2, 1.7, 0.5, 0.1)]
+        mapping = render_speed_segments(self.source, output, segments, preset="ultrafast")
+        information = probe_video(output)
+        self.assertEqual(information["fps"], 12)
+        self.assertTrue(information["has_audio"])
+        self.assertAlmostEqual(information["duration"], mapping.output_duration, delta=1 / 12 + 0.03)
+        with VideoFileClip(str(self.source), audio=False) as source, VideoFileClip(str(output)) as result:
+            _guard_reader_cleanup(source)
+            _guard_reader_cleanup(result)
+            for source_t in (0.1, 0.9, 1.1, 1.8):
+                expected = source.get_frame(source_t)
+                actual = result.get_frame(float(mapping.output_time(source_t)))
+                self.assertLess(np.abs(expected.astype(float) - actual.astype(float)).mean(), 9)
+            self.assertAlmostEqual(result.audio.duration, mapping.output_duration, delta=1 / 12 + 0.05)
+        self.assertFalse(list(self.directory.glob(".video_*")))
+
+    def test_multi_cancel_removes_temporary_files_and_releases_source(self):
+        class Cancelled(RuntimeError):
+            pass
+
+        stopped = False
+
+        def progress(fraction):
+            nonlocal stopped
+            stopped = fraction > 0.3
+
+        def check_stop():
+            if stopped:
+                raise Cancelled("multi render cancelled")
+
+        output = self.directory / "multi_cancelled.mp4"
+        with self.assertRaises(Cancelled):
+            render_speed_segments(
+                self.source, output,
+                [SpeedSegment(0.2, 0.7, 2, 0.1), SpeedSegment(1.2, 1.7, 0.5, 0.1)],
+                preset="ultrafast", check_stop=check_stop, progress=progress,
+            )
+        self.assertFalse(output.exists())
+        self.assertFalse(list(self.directory.glob(".video_*")))
+        self.source.rename(self.directory / "released.mp4")
+
+    def test_multi_one_x_requires_no_rubberband(self):
+        output = self.directory / "multiple_identity.mp4"
+        with patch("apps.speech_speed.require_rubberband", side_effect=AssertionError("unused")):
+            mapping = render_speed_segments(
+                self.source, output, [SpeedSegment(0.2, 0.7, 1, 0.1), SpeedSegment(1.2, 1.7, 1, 0.1)],
+                preset="ultrafast",
+            )
+        self.assertEqual(mapping.output_duration, 2)
+        self.assertTrue(probe_video(output)["has_audio"])
 
     def test_real_render_keeps_source_fps_audio_and_unchanged_frames(self):
         from moviepy import VideoFileClip

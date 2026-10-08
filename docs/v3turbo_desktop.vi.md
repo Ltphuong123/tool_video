@@ -44,19 +44,49 @@ Thanh bên trái sắp xếp theo quy trình: **Đọc văn bản → Đọc ph�
 6. **SRT**: luôn đọc theo mốc bắt đầu tuyệt đối của phụ đề và giữ các khoảng trống. Tự tăng tốc từng câu khi cần vừa khung thời gian, không đẩy câu sau lùi đi. Có tốc độ ban đầu/tối thiểu riêng.
 7. **Fine-tune / API**: chạy lần lượt prepare/train/merge/đóng gói giọng bằng script sẵn có; hoặc chạy API streaming model gốc với CPU/CUDA, cổng và API key. API chỉ bind `127.0.0.1`. Giọng của desktop và giọng đăng ký trong API là hai thư viện riêng.
 8. **Lịch sử & file**: tự đọc lại file đã tạo khi mở tool, tìm theo tên/đường dẫn, lọc loại file, xem thời gian và dung lượng. Nghe audio, lưu bản sao, mở thư mục chứa file hoặc xóa nhiều file. Nhật ký hoạt động nằm ở thẻ riêng trong cùng trang.
-9. **Video**: dùng MoviePy để đổi tốc độ một đoạn trong video dài, chuyển tốc độ từ từ ở hai đầu; giữ tiếng gốc đồng bộ và hạn chế đổi cao độ bằng Rubber Band. Không cần tải model TTS.
+9. **Video**: xem video ngay trong giao diện, tua bằng thước thời gian, kéo chọn/di chuyển/đổi độ dài nhiều đoạn và chỉnh tốc độ riêng. MoviePy xuất video mới, giữ tiếng gốc đồng bộ bằng Rubber Band. Không cần tải model TTS.
 
-## Đổi tốc độ một đoạn video bằng MoviePy
+## Xem video và chỉnh tốc độ nhiều đoạn trên timeline
 
-Trong trang **Chỉnh tốc độ video**, chọn video rồi bấm **Đọc thông tin video** để xem kích thước, FPS và thời lượng. Nhập mốc bắt đầu/kết thúc theo **giây trong video gốc**, tốc độ từ `0.25x` đến `4.0x`, và thời gian chuyển tốc độ mỗi đầu. Bấm **Xuất video** để tạo một MP4 mới; video gốc được giữ lại.
+Trong trang **Chỉnh tốc độ video**, bấm **Chọn…** để mở video ngay trong khung xem trước. Nếu nhập đường dẫn bằng tay, bấm **Mở video**. Nút **Phát / Tạm dừng** phát cả hình và tiếng theo các tốc độ đã áp dụng. Bật/tắt **Âm thanh** cạnh nút phát để nghe hoặc tắt tiếng xem trước; tùy chọn **Giữ âm thanh khi xuất** điều khiển riêng bản xuất. Đọc khung hình và xử lý âm thanh chạy trên luồng nền để giao diện vẫn phản hồi khi tua hoặc mở file.
 
-Ví dụ chọn đoạn `30–45s`, tốc độ `1.5x`, chuyển mỗi đầu `0.5s`: tốc độ tăng dần từ `1.0x` lên `1.5x` trong nửa giây đầu của đoạn nguồn, giữ `1.5x` ở giữa, rồi giảm về `1.0x` trong nửa giây cuối. Các phần trước/sau vẫn chạy `1.0x`. Chuyển `0s` để đổi tốc độ ngay; thời gian chuyển không được lớn hơn nửa độ dài đoạn. Biểu đồ thể hiện đường tốc độ đã chọn. Đổi tốc độ sẽ thay đổi tổng thời lượng và vị trí của phần sau đoạn chỉnh.
+Khi bật tiếng, hình đi theo vị trí thực tế của thiết bị phát âm thanh. Tua, đổi tốc độ hoặc tạm dừng sẽ dừng luồng tiếng cũ; phát tiếp bắt đầu từ vị trí hiện tại. Âm thanh dùng cùng đường thời gian và Rubber Band như bản xuất để giữ cao độ khi đổi tốc độ. Bộ đệm giới hạn theo các cửa sổ nhỏ, không cần xử lý xong toàn bộ video mới phát. Video không có track âm thanh vẫn xem bình thường.
 
-**Giữ tiếng gốc và đổi tốc độ đồng bộ** bật mặc định. Video và audio dùng chung một đường thời gian; audio mono/stereo được xử lý bằng Rubber Band, với các cửa sổ nhỏ chồng lấn ở chỗ chuyển tốc độ. Cách này tránh trôi thời gian tích lũy và hạn chế đổi cao độ; cần nghe kiểm tra chất âm với nội dung thật, nhất là khi đổi tốc độ mạnh. Bỏ dấu chọn để xuất video không tiếng. Khi chọn `1.0x`, phần audio bỏ qua Rubber Band.
+Kéo trên thước thời gian để tua, hoặc dùng phím trái/phải khi timeline có focus để tua một giây. Kéo trên vùng trống của thanh bên dưới để chọn mốc bắt đầu/kết thúc, chọn tốc độ rồi bấm **Thêm đoạn**. Chọn một đoạn màu tím để chỉnh: kéo thanh tốc độ từ `0.25x` đến `4.0x`, kéo hai đầu để đổi độ dài, hoặc kéo thân đoạn để di chuyển. Có thể nhập số chính xác ở bảng bên phải rồi bấm **Áp dụng**. **Xóa đoạn / Xóa tất cả** bỏ các thay đổi tương ứng. Các đoạn không được chồng lên nhau; thao tác kéo được giới hạn bởi đoạn kề bên.
 
-Tool xuất MP4 H.264/AAC, giữ FPS danh nghĩa của nguồn. CRF thấp hơn cho chất lượng cao hơn/file lớn hơn; mặc định `20`. Preset `faster/fast/medium` điều chỉnh thời gian mã hóa; mặc định `fast`. Kích thước lẻ được đệm thêm tối đa một pixel để phù hợp H.264/yuv420p. MoviePy đổi timeline hình ảnh; chức năng này chưa nội suy chuyển động, nên độ mượt khi làm chậm phụ thuộc FPS gốc. Track phụ đề trong video hoặc file SRT đi kèm chưa được tự chuyển mốc.
+Mọi mốc tính theo **giây trong video gốc**, kể cả sau khi thay đổi tốc độ. Các vùng chưa chọn giữ `1.0x`. Danh sách bên phải hiển thị từng đoạn/tốc độ và tổng thời lượng video xuất dự kiến. Bấm **Xuất video** để tạo một MP4 mới từ toàn bộ các đoạn đã áp dụng; các số nhập nhưng chưa áp dụng không thay đổi bản xuất. Chọn video khác sẽ xóa kế hoạch chỉnh của video trước.
+
+Ví dụ thêm đoạn `30–45s` ở `1.5x` và đoạn `60–70s` ở `0.8x`. Mỗi đoạn có thời gian chuyển tốc độ riêng ở hai đầu; mặc định `0.5s`. Trong đoạn đầu, tốc độ tăng từ `1.0x` lên `1.5x`, giữ ở giữa, rồi giảm về `1.0x`. Chuyển `0s` để đổi ngay; thời gian chuyển tối đa nửa độ dài đoạn. Kéo thu ngắn đoạn sẽ tự giảm thời gian chuyển nếu cần. Đổi tốc độ sẽ thay đổi tổng thời lượng và vị trí của phần sau đoạn chỉnh.
+
+**Giữ âm thanh khi xuất** bật mặc định. Video và audio dùng chung một đường thời gian cho tất cả các đoạn; audio mono/stereo được xử lý bằng Rubber Band, với các cửa sổ nhỏ chồng lấn ở chỗ chuyển tốc độ. Cách này tránh trôi thời gian tích lũy và hạn chế đổi cao độ; cần nghe kiểm tra chất âm với nội dung thật, nhất là khi đổi tốc độ mạnh. Bỏ dấu chọn để xuất video không tiếng. Khi mọi đoạn là `1.0x`, phần audio bỏ qua Rubber Band.
+
+Tool xuất MP4 H.264/AAC, giữ FPS danh nghĩa của nguồn. Mức chất lượng thấp hơn cho chất lượng cao hơn/file lớn hơn; mặc định `20` (CRF khi dùng CPU, CQ khi dùng NVIDIA). Hai bộ mã hóa không bảo đảm cùng chất lượng hoặc kích thước file ở cùng một giá trị. Preset `ultrafast/veryfast/faster/fast/medium` đi từ nhanh đến chậm; mặc định `fast`, chọn `veryfast` để ưu tiên tốc độ. Kích thước lẻ được đệm thêm tối đa một pixel để phù hợp H.264/yuv420p. Chức năng này chưa nội suy chuyển động, nên độ mượt khi làm chậm phụ thuộc FPS gốc. Track phụ đề trong video hoặc file SRT đi kèm chưa được tự chuyển mốc.
+
+Khi xuất, tool tự thử mã hóa một khung hình ở kích thước video bằng NVIDIA NVENC. Nếu GPU/bộ mã hóa không hỗ trợ, tool dùng CPU và cho bộ mã hóa tự tận dụng số luồng của máy. Căn theo hai file mốc và chỉnh đoạn với **Chuyển tốc độ = 0s** xử lý hình trực tiếp trong FFmpeg, tránh chuyển từng khung RGB qua Python. Các đoạn có chuyển tốc độ mượt vẫn dùng đường thời gian MoviePy và có thể mã hóa bằng GPU. Âm thanh đổi tốc độ được ghi thẳng sang AAC từ bộ đệm nhỏ; không ghi rồi đọc lại WAV trung gian. Thanh trạng thái báo giai đoạn âm thanh/video, phần trăm và thời gian đã chạy. Cần đóng và mở lại app bằng `run_v3turbo_desktop.bat` để dùng bộ xuất mới.
 
 File `video_<mã>.mp4` lưu trong thư mục đang chọn, xuất hiện trong **Lịch sử & file → Video**. **Mở / nghe** mở video bằng trình phát mặc định; có thể lưu bản sao hoặc xóa như các file khác. Nút **Dừng tác vụ / phát** hủy lượt xuất và dọn file dở. Giới hạn bộ nhớ theo các cửa sổ audio và khung hình, không nạp toàn bộ video vào RAM.
+
+## Tự co giãn video theo hai file mốc
+
+Mở video, rồi dùng khung **Tự căn video theo mốc** ở bên phải:
+
+1. Bấm **Mốc cũ…** để nhập các thời điểm trong video gốc. Các mốc được ghim cố định lên timeline; bấm pin hoặc chọn dòng trong bảng để tua tới đúng vị trí nguồn.
+2. Bấm **Mốc mới…** để nhập thời điểm đích. Bảng đối chiếu hiển thị số thứ tự và thời gian cũ/mới theo giây; di chuột lên pin để xem timestamp đầy đủ.
+3. Bấm **Căn theo mốc**. Hệ thống tự tính tốc độ cho từng khoảng để mốc cũ trùng mốc mới có cùng số thứ tự. Bấm **Phát** để xem trước cả hình và tiếng; đồng hồ hiển thị thời gian gốc và thời gian mới.
+4. Bấm **Xuất video**. Phần sau mốc cuối giữ tốc độ **1x**. Video gốc được giữ lại.
+
+File văn bản UTF-8 có mỗi số thứ tự trên một dòng, timestamp `HH:MM:SS,mmm` ở dòng tiếp theo, có thể thêm dòng trống giữa các cặp. Hai file cần cùng tập số thứ tự, không trùng ID, và thời gian tăng dần. Mốc cũ không được vượt thời lượng video. Có sẵn [file mốc cũ](../examples/video_markers/old_marks.txt) và [file mốc mới](../examples/video_markers/new_marks.txt) theo ví dụ:
+
+| Mốc | Cũ | Mới |
+| --- | --- | --- |
+| 1 | 00:00:00,060 | 00:00:00,133 |
+| 2 | 00:00:03,130 | 00:00:02,995 |
+| 3 | 00:00:06,290 | 00:00:05,666 |
+| 4 | 00:00:08,950 | 00:00:07,666 |
+
+Tốc độ mỗi khoảng bằng **độ dài khoảng cũ / độ dài khoảng mới**. Đoạn từ đầu video đến mốc đầu cũng được co giãn từ gốc `(0, 0)`. Nếu một file bắt đầu ở `00:00:00,000`, file kia cũng cần bắt đầu ở 0. Các đoạn đổi tốc độ ngay tại mốc; không áp dụng ramp vì ramp sẽ làm lệch thời điểm đích. Chế độ căn mốc cho phép tốc độ ngoài giới hạn chỉnh tay `0.25–4x` để giữ đúng yêu cầu, nên hãy nghe/xem trước nếu phải kéo giãn mạnh. Mốc được tính theo mili giây; hình xuất vẫn có độ phân giải thời gian theo FPS của nguồn.
+
+Khi đang căn theo mốc, các nút/ô chỉnh tốc độ bằng tay được khóa. **Bỏ căn** khôi phục các đoạn chỉnh tay trước đó và giữ hai file mốc để có thể căn lại. Nhập file mốc khác sẽ bỏ bản căn hiện tại trước khi áp dụng bộ mốc mới. Đổi video xóa cả mốc và bản căn của video trước.
 
 ## Nơi lưu và lịch sử file
 
@@ -138,11 +168,18 @@ $env:PYTHONPATH = 'src'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_srt_timing.py -v
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_desktop_ui.py -v
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_editor.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_fast_export.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_export_audio.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_preview.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_preview_audio.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_markers.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_marker_timeline.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_marker_workflow.py -v
 .\.venv\Scripts\python.exe v3turbo_desktop.py --check
 ```
 
 Test dùng model giả để kiểm tra thứ tự batch, lưu WAV, streaming, dừng/đóng generator, khóa model, truyền tham số, SRT, thư viện giọng và kiểm tra dữ liệu. Test Rubber Band kiểm tra thời lượng/cao độ ở nhiều sample rate, áp dụng cho các chức năng đọc, streaming giữ nguồn float, watermark sau đổi tốc độ và báo lỗi thiếu dependency trước suy luận. Test streaming kiểm tra không ghi WAV trung gian, model tái sử dụng mảng audio, tràn bộ đệm ra file tạm và dọn sạch khi dừng. Test hội thoại kiểm tra nhóm giọng, giới hạn batch, thứ tự và khoảng nghỉ. Test phụ đề kiểm tra chia câu, khoảng nghỉ, mốc thời gian sau chỉnh tốc độ và việc xóa cặp file chưa hoàn tất khi gặp lỗi. Những kiểm tra này không thay thế việc nghe so sánh để đánh giá độ tự nhiên của giọng. `--check` dựng giao diện ẩn, không tải model và không ghi micro/phát audio.
 
-Test lưu trữ và giao diện kiểm tra nhớ nơi lưu sau khi mở lại, lịch sử nhiều thư mục, lọc/tìm kiếm, xóa nhiều file và audio + SRT, hủy thao tác xóa, bảo vệ thư viện giọng và chặn thao tác khi đang chạy. Bố cục được kiểm tra ở kích thước `980×620` và `1280×850` bằng cửa sổ thử nghiệm ẩn.
+Test lưu trữ và giao diện kiểm tra nhớ nơi lưu sau khi mở lại, lịch sử nhiều thư mục, lọc/tìm kiếm, xóa nhiều file và audio + SRT, hủy thao tác xóa, bảo vệ thư viện giọng và chặn thao tác khi đang chạy. Bố cục được kiểm tra ở kích thước `980×620` và `1280×850` bằng cửa sổ thử nghiệm ẩn. Test video kiểm tra kéo chọn/di chuyển/thu ngắn đoạn, giữ chính xác các mốc liền kề, thay tốc độ qua slider và nhập số, kế hoạch xuất nhiều đoạn, đồng bộ âm thanh và hình. Test preview kiểm tra tua gộp, loại kết quả của file cũ, đóng reader và phát/tua một video mẫu thật trong khung Tkinter.
 
 Benchmark đọc/ghi và điều phối streaming, dùng model giả và thay time-stretch bằng phép lấy mẫu đơn giản để tách chi phí này khỏi suy luận/DSP: median 5 lượt với nguồn 20/60/600 giây lần lượt giảm từ 33.87/105.42/784.89 ms xuống 19.82/61.73/411.20 ms trên máy phát triển. Đây là cải thiện khoảng 41–48% của phần đọc/ghi và điều phối, chưa phải mức tăng tốc tạo giọng của model. Script và số liệu nằm trong `outputs/audio_benchmark/` ở máy phát triển. Hội thoại nhiều câu liên tiếp cùng giọng có thể tận dụng batching CUDA; mức tăng tốc thực tế phụ thuộc phần cứng và nội dung, CPU vẫn có thể suy luận tuần tự.

@@ -611,7 +611,7 @@ class TurboTool:
             raise ValueError("Tốc độ video cần 0.25–4.0x; thời gian chuyển không vượt nửa đoạn đã chọn.")
         if not isinstance(quality, int) or isinstance(quality, bool) or not 18 <= quality <= 28:
             raise ValueError("Chất lượng video CRF phải là số nguyên 18–28.")
-        if preset not in ("fast", "medium", "faster"):
+        if preset not in ("ultrafast", "veryfast", "faster", "fast", "medium"):
             raise ValueError("Cấu hình xuất video không hợp lệ.")
         source = Path(path).expanduser().resolve()
         if not source.is_file():
@@ -628,9 +628,80 @@ class TurboTool:
             except BaseException:
                 destination.unlink(missing_ok=True)
                 raise
-            note = f"MoviePy · {start:.2f}–{end:.2f}s · {speed:g}x · chuyển tốc độ {ramp_seconds:g}s."
+            note = f"{start:.2f}–{end:.2f}s · {speed:g}x · chuyển tốc độ {ramp_seconds:g}s."
             if result is not None:
                 note += f" Video xuất {result.output_duration:.2f}s."
+            return destination, note
+
+    def edit_video_segments(self, path, segments, keep_audio=True, quality=20,
+                            preset="fast", progress: Callable = lambda message: None):
+        """Render a snapshot of several source-time ranges without loading TTS."""
+        from apps.video_editor import SpeedSegment, render_speed_segments
+
+        segments = tuple(SpeedSegment(float(item.start), float(item.end), float(item.speed),
+                                      float(item.ramp_seconds)) for item in segments)
+        if not segments:
+            raise ValueError("Hãy thêm ít nhất một đoạn tốc độ trước khi xuất video.")
+        for segment in segments:
+            if not all(math.isfinite(value) for value in
+                       (segment.start, segment.end, segment.speed, segment.ramp_seconds)):
+                raise ValueError("Mốc thời gian và tốc độ video phải là số hữu hạn.")
+            if segment.start < 0 or segment.end <= segment.start:
+                raise ValueError("Mốc kết thúc phải sau mốc bắt đầu và mốc bắt đầu không âm.")
+            if not 0.25 <= segment.speed <= 4 or not 0 <= segment.ramp_seconds <= (segment.end - segment.start) / 2:
+                raise ValueError("Tốc độ video cần 0.25–4.0x; thời gian chuyển không vượt nửa đoạn đã chọn.")
+        ordered = sorted(segments, key=lambda item: item.start)
+        if any(current.end > following.start for current, following in zip(ordered, ordered[1:])):
+            raise ValueError("Các đoạn tốc độ không được chồng lên nhau.")
+        if not isinstance(quality, int) or isinstance(quality, bool) or not 18 <= quality <= 28:
+            raise ValueError("Chất lượng video CRF phải là số nguyên 18–28.")
+        if preset not in ("ultrafast", "veryfast", "faster", "fast", "medium"):
+            raise ValueError("Cấu hình xuất video không hợp lệ.")
+        source = Path(path).expanduser().resolve()
+        if not source.is_file():
+            raise ValueError("Không tìm thấy video đầu vào.")
+        with self.operation(require_model=False):
+            destination = self._path("video", ".mp4")
+            try:
+                result = render_speed_segments(source, destination, segments, keep_audio=keep_audio,
+                                               quality=quality, preset=preset,
+                                               check_stop=self.check_stop, progress=progress)
+                self.check_stop()
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+            note = f"{len(segments)} đoạn tốc độ."
+            if result is not None:
+                note += f" Video xuất {result.output_duration:.2f}s."
+            return destination, note
+
+    def edit_video_markers(self, path, old_markers, new_markers, keep_audio=True,
+                           quality=20, preset="fast", progress: Callable = lambda message: None):
+        """Align a snapshot of numbered source and target anchors in a new MP4."""
+        from apps.video_markers import validate_marker_pairs
+        from apps.video_editor import render_marker_alignment
+
+        old_markers, new_markers = validate_marker_pairs(tuple(old_markers), tuple(new_markers))
+        if not isinstance(quality, int) or isinstance(quality, bool) or not 18 <= quality <= 28:
+            raise ValueError("Chất lượng video CRF phải là số nguyên 18–28.")
+        if preset not in ("ultrafast", "veryfast", "faster", "fast", "medium"):
+            raise ValueError("Cấu hình xuất video không hợp lệ.")
+        source = Path(path).expanduser().resolve()
+        if not source.is_file():
+            raise ValueError("Không tìm thấy video đầu vào.")
+        with self.operation(require_model=False):
+            destination = self._path("video", ".mp4")
+            try:
+                result = render_marker_alignment(source, destination, old_markers, new_markers,
+                                                 keep_audio=keep_audio, quality=quality, preset=preset,
+                                                 check_stop=self.check_stop, progress=progress)
+                self.check_stop()
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+            note = f"Đã căn {len(old_markers)} mốc cũ theo mốc mới · phần đuôi giữ 1x."
+            if result is not None:
+                note += f" Video xuất {result.output_duration:.3f}s."
             return destination, note
 
     def _persist_voices(self):

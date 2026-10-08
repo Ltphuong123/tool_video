@@ -73,6 +73,40 @@ class WavePlayer:
         self._buffers = []
         self._stream = None
         self._rate = None
+        self._clock_lock = threading.RLock()
+        self._written_frames = 0
+        self._finished_position = 0.0
+        self._stream_origin = None
+
+    @property
+    def position_seconds(self):
+        """Read the device playback clock, including pauses caused by underruns."""
+        with self._clock_lock:
+            if self._rate is None:
+                return 0.0
+            if self._handle is not None:
+                # MMTIME: UINT wType followed by an eight-byte union.
+                class MultimediaTime(ctypes.Structure):
+                    _fields_ = [("kind", ctypes.c_uint32), ("value", ctypes.c_uint32),
+                                ("extra", ctypes.c_uint32)]
+                position = MultimediaTime(2, 0, 0)  # TIME_SAMPLES
+                code = self._winmm.waveOutGetPosition(self._handle, ctypes.byref(position),
+                                                     ctypes.sizeof(position))
+                if code:
+                    raise RuntimeError(f"Không đọc được vị trí phát âm thanh (mã {code}).")
+                if position.kind == 2:
+                    seconds = position.value / self._rate
+                elif position.kind == 1:  # TIME_MS
+                    seconds = position.value / 1000
+                elif position.kind == 4:  # TIME_BYTES, mono int16
+                    seconds = position.value / (self._rate * 2)
+                else:
+                    raise RuntimeError("Thiết bị không hỗ trợ đồng hồ phát âm thanh.")
+                return min(self._written_frames / self._rate, seconds)
+            if self._stream is not None and self._stream_origin is not None:
+                seconds = max(0, self._stream.time - self._stream_origin - self._stream.latency)
+                return min(self._written_frames / self._rate, seconds)
+            return self._finished_position
 
     def stop(self):
         # Only signal here: the playback worker owns and releases native buffers.
@@ -91,6 +125,7 @@ class WavePlayer:
                 raise RuntimeError("Phát audio ngoài Windows cần cài sounddevice.") from exc
             self._stream = sounddevice.RawOutputStream(samplerate=rate, channels=1, dtype="int16")
             self._stream.start()
+            self._stream_origin = self._stream.time
             return
 
         class WaveFormat(ctypes.Structure):
@@ -114,6 +149,7 @@ class WavePlayer:
             getattr(self._winmm, name).argtypes = [ctypes.c_void_p, ctypes.POINTER(WaveHeader), ctypes.c_uint32]
         for name in ("waveOutReset", "waveOutClose"):
             getattr(self._winmm, name).argtypes = [ctypes.c_void_p]
+        self._winmm.waveOutGetPosition.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
         fmt = WaveFormat(1, 1, rate, rate * 2, 2, 16, 0)
         handle = ctypes.c_void_p()
         code = self._winmm.waveOutOpen(ctypes.byref(handle), 0xFFFFFFFF, ctypes.byref(fmt), 0, 0, 0)
@@ -145,6 +181,7 @@ class WavePlayer:
             data = (wav[start:start + rate // 5].clip(-1, 1) * 32767).astype("<i2").tobytes()
             if self._stream is not None:
                 self._stream.write(data)
+                self._written_frames += len(data) // 2
                 continue
             while len(self._buffers) >= 6:
                 self._check()
@@ -160,6 +197,7 @@ class WavePlayer:
             code = self._winmm.waveOutWrite(self._handle, ctypes.byref(header), ctypes.sizeof(header))
             if code:
                 raise RuntimeError(f"Không phát được audio (mã {code}).")
+            self._written_frames += len(data) // 2
 
     def finish(self):
         while self._buffers:
@@ -168,8 +206,18 @@ class WavePlayer:
             time.sleep(0.01)
         if self._stream is not None:
             self._stream.stop()
+        if self._rate:
+            self._finished_position = self._written_frames / self._rate
 
     def close(self):
+        with self._clock_lock:
+            self._close_device()
+
+    def _close_device(self):
+        try:
+            self._finished_position = max(self._finished_position, self.position_seconds)
+        except RuntimeError:
+            pass
         if self._stream is not None:
             self._stream.abort()
             self._stream.close()

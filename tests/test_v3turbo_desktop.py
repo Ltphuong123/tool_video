@@ -222,6 +222,147 @@ class DesktopToolTests(unittest.TestCase):
                 self.tool.edit_video(source, 1, 5)
             render.assert_not_called()
 
+    def test_video_segments_export_forwards_every_segment_without_loading_tts(self):
+        from apps.video_editor import SpeedSegment
+
+        source = self.folder / "original video.mp4"
+        source.write_bytes(b"original video bytes")
+        destination = self.folder / "multiple segment exports"
+        tool = TurboTool(self.folder, factory=FakeTurbo)
+        tool.set_output_dir(destination)
+        segments = [SpeedSegment(1, 3, speed=0.75, ramp_seconds=0.5),
+                    SpeedSegment(5, 8, speed=2, ramp_seconds=0.25)]
+        messages = []
+
+        def render(input_path, output_path, selected, **kwargs):
+            self.assertEqual(Path(input_path), source)
+            self.assertEqual(Path(output_path).parent, destination)
+            self.assertEqual(list(selected), segments)
+            self.assertFalse(kwargs["keep_audio"])
+            self.assertEqual(kwargs["quality"], 23)
+            self.assertEqual(kwargs["preset"], "medium")
+            kwargs["check_stop"]()
+            kwargs["progress"]("Exporting the second segment")
+            Path(output_path).write_bytes(b"rendered multi-segment MP4")
+            return SimpleNamespace(output_duration=21.5)
+
+        with patch("apps.video_editor.render_speed_segments", side_effect=render) as backend, \
+             patch.object(tool, "load") as load:
+            result, note = tool.edit_video_segments(source, segments, keep_audio=False,
+                                                   quality=23, preset="medium", progress=messages.append)
+        backend.assert_called_once()
+        load.assert_not_called()
+        self.assertIsNone(tool.tts)
+        self.assertEqual(result.read_bytes(), b"rendered multi-segment MP4")
+        self.assertEqual(source.read_bytes(), b"original video bytes")
+        self.assertTrue(note)
+        self.assertEqual(messages, ["Exporting the second segment"])
+        self.assertEqual([(row.path, row.kind) for row in tool.list_outputs()], [(result, "Video")])
+
+    def test_video_segments_cancellation_removes_output_and_allows_retry_without_tts(self):
+        from apps.video_editor import SpeedSegment
+
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        tool = TurboTool(self.folder, factory=FakeTurbo)
+        segments = [SpeedSegment(1, 3), SpeedSegment(5, 8, speed=0.8)]
+
+        for check_in_backend in (True, False):
+            def cancel_render(_source, destination, selected, **kwargs):
+                self.assertEqual(list(selected), segments)
+                Path(destination).write_bytes(b"partial video")
+                tool.stop()
+                if check_in_backend:
+                    kwargs["check_stop"]()
+                return SimpleNamespace(output_duration=12.0)
+
+            with self.subTest(check_in_backend=check_in_backend), \
+                 patch("apps.video_editor.render_speed_segments", side_effect=cancel_render):
+                with self.assertRaises(Cancelled):
+                    tool.edit_video_segments(source, segments)
+            self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
+            self.assertEqual(source.read_bytes(), b"original")
+
+        def successful_render(_source, destination, selected, **kwargs):
+            kwargs["check_stop"]()
+            self.assertEqual(list(selected), segments)
+            Path(destination).write_bytes(b"completed")
+            return SimpleNamespace(output_duration=12.0)
+
+        with patch("apps.video_editor.render_speed_segments", side_effect=successful_render):
+            output, _ = tool.edit_video_segments(source, segments)
+        self.assertEqual(output.read_bytes(), b"completed")
+        self.assertIsNone(tool.tts)
+
+    def test_video_segments_encoder_failure_removes_partial_output_and_releases_lock(self):
+        from apps.video_editor import SpeedSegment
+
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+
+        def failing_render(_source, destination, selected, **kwargs):
+            Path(destination).write_bytes(b"partial video")
+            raise OSError("Encoder failed on the second segment")
+
+        with patch("apps.video_editor.render_speed_segments", side_effect=failing_render):
+            with self.assertRaisesRegex(OSError, "second segment"):
+                self.tool.edit_video_segments(source, [SpeedSegment(1, 3), SpeedSegment(5, 8)])
+        self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
+        self.assertEqual(source.read_bytes(), b"original")
+        self.assertTrue(self.tool.synthesize("Again").exists())
+
+    def test_video_segments_export_cannot_start_during_another_operation(self):
+        from apps.video_editor import SpeedSegment
+
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        with self.tool.operation(), patch("apps.video_editor.render_speed_segments") as render:
+            with self.assertRaises(RuntimeError):
+                self.tool.edit_video_segments(source, [SpeedSegment(1, 3), SpeedSegment(5, 8)])
+            render.assert_not_called()
+        self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
+
+    def test_video_segments_export_rejects_invalid_selection_before_rendering(self):
+        from apps.video_editor import SpeedSegment
+
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        selections = [[], [SpeedSegment(-1, 3)], [SpeedSegment(3, 3)],
+                      [SpeedSegment(1, float("inf"))], [SpeedSegment(float("nan"), 3)],
+                      [SpeedSegment(1, 3, speed=0)], [SpeedSegment(1, 3, speed=5)],
+                      [SpeedSegment(1, 3, ramp_seconds=-0.1)],
+                      [SpeedSegment(1, 3, ramp_seconds=1.1)],
+                      [SpeedSegment(1, 4), SpeedSegment(3, 5)]]
+        with patch("apps.video_editor.render_speed_segments") as render:
+            for segments in selections:
+                with self.subTest(segments=segments), self.assertRaises(ValueError):
+                    self.tool.edit_video_segments(source, segments)
+                render.assert_not_called()
+            for options in (dict(quality=100), dict(preset="unknown")):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    self.tool.edit_video_segments(source, [SpeedSegment(1, 3)], **options)
+                render.assert_not_called()
+        self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
+
+    def test_video_segments_export_passes_an_immutable_snapshot_to_renderer(self):
+        from apps.video_editor import SpeedSegment
+
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        segments = [SpeedSegment(1, 3), SpeedSegment(5, 8)]
+        expected = tuple(segments)
+
+        def render(_source, destination, selected, **kwargs):
+            segments.clear()
+            self.assertIsInstance(selected, tuple)
+            self.assertEqual(selected, expected)
+            Path(destination).write_bytes(b"completed")
+            return SimpleNamespace(output_duration=12.0)
+
+        with patch("apps.video_editor.render_speed_segments", side_effect=render):
+            output, _ = self.tool.edit_video_segments(source, segments)
+        self.assertEqual(output.read_bytes(), b"completed")
+
     def test_video_export_rejects_invalid_numbers_before_rendering(self):
         source = self.folder / "input.mp4"
         source.write_bytes(b"original")

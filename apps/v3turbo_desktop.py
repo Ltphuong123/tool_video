@@ -17,6 +17,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from apps.desktop_audio import MicrophoneRecorder, PlaybackStopped, WavePlayer
+from apps.video_editor import SpeedSegment, build_multi_speed_time_map
+from apps.video_markers import build_marker_time_map, read_marker_file
+from apps.video_preview import VideoPreview
+from apps.video_timeline import VideoTimeline, time_label
 from apps.v3turbo_tool import Cancelled, DEFAULT_MODEL, OUTPUT_KINDS, ROOT, Sampling, TurboTool, read_document
 
 
@@ -180,8 +184,10 @@ class DesktopApp:
 
     def _page_changed(self, event=None):
         current = self.book.select()
+        if hasattr(self, "video_preview") and current != str(self.pages["Video"]):
+            self.video_preview.pause()
         captions = {"Văn bản": "Viết nội dung, chọn giọng và tạo audio.", "SRT": "Giữ mốc phụ đề, tự căn tốc độ từng câu.",
-                    "Video": "Đổi tốc độ một đoạn, chuyển êm ở hai đầu và giữ đồng bộ âm thanh.",
+                    "Video": "Xem video, kéo chọn các đoạn trên timeline và chỉnh tốc độ riêng.",
                     "Hàng loạt": "Tạo nhiều audio trong một lượt và xuất ZIP.", "Hội thoại": "Gán giọng theo nhân vật và điều chỉnh khoảng nghỉ.",
                     "Clone / Giọng": "Tạo và quản lý thư viện giọng riêng.", "Kết quả / Log": "Tìm, nghe, lưu bản sao và quản lý file đã tạo.",
                     "Cấu hình": "Model, thiết bị, tham số đọc và nơi lưu kết quả.", "Fine-tune / API": "Huấn luyện giọng và chạy API trên máy."}
@@ -425,105 +431,491 @@ class DesktopApp:
         self._button(row, "Tạo audio từ SRT", self.srt, primary=True)
 
     def _video_tab(self):
-        tab = self._tab("Video", scroll=True)
-        self.video_path = self._path_field(tab, "Video đầu vào", types=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm"), ("Tất cả", "*.*")])
-        self.video_details = tk.StringVar(value="Chọn video, rồi đọc thông tin để xem thời lượng và FPS.")
-        ttk.Label(tab, textvariable=self.video_details, style="Muted.TLabel", wraplength=700).pack(anchor="w", pady=(4, 6))
+        tab = self._tab("Video")
+        tab.configure(padding=(12, 4))
+        self.video_segments = []
+        self.video_selected = None
+        self.video_duration = 0.0
+        self.video_old_markers = ()
+        self.video_new_markers = ()
+        self.video_marker_mapping = None
+        self._video_manual_segments = None
+        self._video_open_path = None
+        self._video_sync = False
         row = ttk.Frame(tab)
         row.pack(fill="x")
-        self._button(row, "Đọc thông tin video", self.inspect_video)
-        settings = ttk.LabelFrame(tab, text="Đoạn cần thay đổi tốc độ", padding=14)
-        settings.pack(fill="x", pady=(12, 10))
-        self.video_start, _, _ = self._field(settings, "Bắt đầu trong video gốc (s)", 0)
-        self.video_end, _, _ = self._field(settings, "Kết thúc trong video gốc (s)", 10)
-        self.video_speed, _, _ = self._field(settings, "Tốc độ đoạn (0.25–4.0x)", 1.5)
-        self.video_ramp, _, _ = self._field(settings, "Chuyển tốc độ mỗi đầu (s)", 0.5)
-        self.video_curve = tk.Canvas(settings, height=95, background="#f8faff", highlightthickness=0)
-        self.video_curve.pack(fill="x", pady=(10, 0))
-        self.video_curve.bind("<Configure>", lambda event: self._draw_video_curve())
-        for variable in (self.video_start, self.video_end, self.video_speed, self.video_ramp):
-            variable.trace_add("write", lambda *_: self._draw_video_curve())
+        ttk.Label(row, text="Video", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        self.video_path = tk.StringVar()
+        ttk.Entry(row, textvariable=self.video_path).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._button(row, "Chọn…", self.choose_video).pack_configure(pady=0)
+        self._button(row, "Mở video", self.inspect_video).pack_configure(pady=0)
+        self.video_details = tk.StringVar(value="Chọn video để xem và kéo chọn các đoạn tốc độ.")
+        workspace = ttk.Panedwindow(tab, orient="horizontal")
+        workspace.pack(fill="both", expand=True, pady=(6, 0))
+        viewer = ttk.Frame(workspace)
+        sidebar = ttk.Frame(workspace, width=245)
+        workspace.add(viewer, weight=3)
+        workspace.add(sidebar, weight=1)
+        viewer.columnconfigure(0, weight=1)
+        viewer.rowconfigure(0, weight=1)
+        self.video_preview = VideoPreview(viewer, on_position=self._video_position, height=150)
+        self.video_preview.grid(row=0, column=0, sticky="nsew")
+        playback = ttk.Frame(viewer)
+        playback.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        self.video_play_button = ttk.Button(playback, text="▶ Phát", command=lambda: self._guard(self.toggle_video_play), state="disabled")
+        self.video_play_button.pack(side="left")
+        self.video_time = tk.StringVar(value="00:00.00 / 00:00.00")
+        ttk.Label(playback, textvariable=self.video_time, style="Muted.TLabel").pack(side="left", padx=8)
+        self.video_sound = tk.BooleanVar(value=True)
+        ttk.Checkbutton(playback, text="Âm thanh", variable=self.video_sound,
+                        command=lambda: self.video_preview.set_audio_enabled(self.video_sound.get())).pack(side="right")
+        self.video_timeline = VideoTimeline(viewer, on_select=self._video_select,
+                                           on_change=self._video_segments_changed, on_seek=self._video_seek)
+        self.video_timeline.grid(row=2, column=0, sticky="ew")
+        canvas = tk.Canvas(sidebar, width=245, highlightthickness=0, background="#ffffff")
+        scrollbar = ttk.Scrollbar(sidebar, orient="vertical", command=canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        settings = ttk.Frame(canvas, padding=(12, 0))
+        ttk.Label(settings, textvariable=self.video_details, style="Muted.TLabel",
+                  wraplength=225, font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 7))
+        window = canvas.create_window((0, 0), window=settings, anchor="nw")
+        settings.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        def wheel(event):
+            canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+        canvas.bind("<MouseWheel>", wheel)
+        settings.bind("<MouseWheel>", wheel)
+        markers = ttk.LabelFrame(settings, text="Tự căn video theo mốc", padding=8)
+        markers.pack(fill="x", pady=(0, 12))
+        self.video_old_marks_path = tk.StringVar()
+        self.video_new_marks_path = tk.StringVar()
+        actions = ttk.Frame(markers)
+        actions.pack(fill="x")
+        self._button(actions, "Mốc cũ…", lambda: self.import_video_markers("old"))
+        self._button(actions, "Mốc mới…", lambda: self.import_video_markers("new"))
+        self.video_marker_status = tk.StringVar(value="Nhập hai file số thứ tự + HH:MM:SS,mmm")
+        ttk.Label(markers, textvariable=self.video_marker_status, style="Muted.TLabel",
+                  wraplength=215, font=("Segoe UI", 8)).pack(anchor="w", pady=4)
+        self.video_marker_table = ttk.Treeview(markers, columns=("index", "old", "new"),
+                                              show="headings", height=4, selectmode="browse")
+        for key, title, width in (("index", "#", 30), ("old", "Gốc (s)", 85), ("new", "Mới (s)", 85)):
+            self.video_marker_table.heading(key, text=title)
+            self.video_marker_table.column(key, width=width, minwidth=25, stretch=key != "index")
+        self.video_marker_table.pack(fill="x", pady=4)
+        self.video_marker_table.bind("<<TreeviewSelect>>", self._video_marker_selected)
+        actions = ttk.Frame(markers)
+        actions.pack(fill="x")
+        self._button(actions, "Căn theo mốc", self.align_video_markers, primary=True)
+        self._button(actions, "Bỏ căn", self.clear_video_marker_alignment)
+        ttk.Label(markers, text="Ghép theo số thứ tự; phần đuôi giữ 1x.", style="Muted.TLabel",
+                  wraplength=215, font=("Segoe UI", 8)).pack(anchor="w")
+        self.video_selection_label = tk.StringVar(value="Chọn đoạn trên timeline")
+        ttk.Label(settings, textvariable=self.video_selection_label, style="Section.TLabel").pack(anchor="w", pady=(0, 7))
+        created_fields = []
+        def field(label, default):
+            line = ttk.Frame(settings)
+            line.pack(fill="x", pady=3)
+            ttk.Label(line, text=label, width=13).pack(side="left")
+            variable = tk.StringVar(value=str(default))
+            entry = ttk.Entry(line, textvariable=variable, width=10)
+            entry.pack(side="left", fill="x", expand=True)
+            created_fields.append(entry)
+            return variable
+        self.video_start = field("Bắt đầu (s)", 0)
+        self.video_end = field("Kết thúc (s)", 10)
+        self.video_speed = field("Tốc độ (x)", 1.5)
+        self.video_speed_slider = tk.DoubleVar(value=1.5)
+        self.video_speed_control = ttk.Scale(settings, from_=0.25, to=4, variable=self.video_speed_slider,
+                                             command=self._video_speed_drag)
+        self.video_speed_control.pack(fill="x", pady=5)
+        self.video_ramp = field("Chuyển mỗi đầu (s)", 0.5)
+        self.video_manual_fields = list(created_fields)
+        actions = ttk.Frame(settings)
+        actions.pack(fill="x", pady=4)
+        self.video_manual_buttons = [self._button(actions, "Thêm đoạn", self.add_video_segment, primary=True),
+                                     self._button(actions, "Áp dụng", self.apply_video_segment)]
+        self.video_segment_list = ttk.Treeview(settings, columns=("range", "speed"), show="headings", height=4,
+                                               selectmode="browse")
+        self.video_segment_list.heading("range", text="Đoạn (giây)")
+        self.video_segment_list.heading("speed", text="Tốc độ")
+        self.video_segment_list.column("range", width=135, minwidth=85)
+        self.video_segment_list.column("speed", width=65, minwidth=50)
+        self.video_segment_list.pack(fill="x", pady=5)
+        self.video_segment_list.bind("<<TreeviewSelect>>", self._video_list_select)
+        actions = ttk.Frame(settings)
+        actions.pack(fill="x")
+        self.video_manual_buttons.extend([self._button(actions, "Xóa đoạn", self.delete_video_segment),
+                                          self._button(actions, "Xóa tất cả", self.clear_video_segments)])
+        self.video_output_duration = tk.StringVar(value="Các phần chưa chọn giữ tốc độ 1.0x")
+        ttk.Label(settings, textvariable=self.video_output_duration, style="Muted.TLabel", wraplength=240).pack(anchor="w", pady=6)
         self.video_keep_audio = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tab, text="Giữ tiếng gốc và đổi tốc độ đồng bộ · Rubber Band giữ cao độ",
-                        variable=self.video_keep_audio).pack(anchor="w", pady=6)
-        self.video_quality, _, _ = self._field(tab, "Chất lượng MP4 · CRF", 20, ["18", "20", "23", "26", "28"])
-        self.video_preset, _, _ = self._field(tab, "Tốc độ xuất video", "fast", ["faster", "fast", "medium"])
-        ttk.Label(tab, text="Mốc và thời gian chuyển tính theo video gốc. Chuyển 0 giây để đổi ngay; "
-                  "tối đa nửa độ dài đoạn. Các phần khác giữ tốc độ 1.0x.\n"
-                  "Độ mượt khi làm chậm phụ thuộc FPS của nguồn.\n"
-                  "Xuất MP4 mới trong nơi lưu đang chọn; video đầu vào được giữ lại. Không cần tải model TTS.",
-                  wraplength=700, style="Muted.TLabel").pack(anchor="w", pady=(10, 4))
+        ttk.Checkbutton(settings, text="Giữ âm thanh khi xuất", variable=self.video_keep_audio).pack(anchor="w", pady=4)
+        self.video_quality = field("Chất lượng (18–28)", 20)
+        self.video_preset = tk.StringVar(value="fast")
+        ttk.Label(settings, text="Preset xuất (nhanh → chậm)").pack(anchor="w")
+        ttk.Combobox(settings, textvariable=self.video_preset,
+                     values=["ultrafast", "veryfast", "faster", "fast", "medium"],
+                     state="readonly").pack(fill="x", pady=4)
+        ttk.Label(settings, text="Tự dùng GPU nếu hỗ trợ. veryfast ưu tiên tốc độ xuất.",
+                  style="Muted.TLabel", wraplength=240).pack(anchor="w", pady=4)
+        def bind_wheel(widget):
+            widget.bind("<MouseWheel>", wheel, add="+")
+            for child in widget.winfo_children():
+                bind_wheel(child)
+        bind_wheel(settings)
         page = self.pages["Video"]
         row = ttk.Frame(page, padding=(16, 4))
         row.pack(side="bottom", fill="x", before=page.winfo_children()[0])
         self.video_export_button = self._button(row, "Xuất video", self.export_video, primary=True)
+        self.video_path.trace_add("write", self._video_path_changed)
 
-    def _draw_video_curve(self):
-        canvas = self.video_curve
-        canvas.delete("all")
-        width = max(240, canvas.winfo_width())
-        try:
-            start, end, speed, ramp = (float(variable.get()) for variable in
-                                       (self.video_start, self.video_end, self.video_speed, self.video_ramp))
-            if not all(math.isfinite(value) for value in (start, end, speed, ramp)) or end <= start or speed <= 0:
-                return
-        except ValueError:
-            return
-        fraction = min(0.5, max(0, ramp / (end - start)))
-        low, high = min(1, speed), max(1, speed)
-        span = max(0.5, high - low)
-        def y(value):
-            return 62 - (value - low) / span * 40
-        coordinates = []
-        for index in range(161):
-            position = index / 160
-            local = (position - 0.15) / 0.7
-            if local < 0 or local > 1:
-                value = 1
-            elif fraction and (local < fraction or local > 1 - fraction):
-                amount = min(local, 1 - local) / fraction
-                value = 1 + (speed - 1) * amount * amount * (3 - 2 * amount)
-            else:
-                value = speed
-            coordinates.extend((16 + position * (width - 32), y(value)))
-        canvas.create_line(16, y(1), width - 16, y(1), fill="#d7dfea", dash=(3, 3))
-        canvas.create_line(*coordinates, fill="#5b48ef", width=2, smooth=False)
-        canvas.create_text(20, 83, text="1.0x", anchor="w", fill="#64718a", font=("Segoe UI", 9))
-        canvas.create_text(width / 2, 83, text=f"Đoạn đã chọn · {speed:g}x", fill="#5b48ef", font=("Segoe UI", 9))
-        canvas.create_text(width - 20, 83, text="1.0x", anchor="e", fill="#64718a", font=("Segoe UI", 9))
+    def _video_path_changed(self, *_):
+        self._video_open_path = None
+        self.video_preview.unload()
+        self.video_duration = 0.0
+        self._video_position(0, False)
+        self.video_segments = []
+        self.video_selected = None
+        self.video_timeline.set_video(0)
+        self.video_segment_list.delete(*self.video_segment_list.get_children())
+        self.video_play_button.configure(state="disabled")
+        self.video_selection_label.set("Chọn đoạn trên timeline")
+        self.video_output_duration.set("Mở video để chỉnh các đoạn tốc độ")
+        self.video_details.set("Bấm Mở video để xem và chỉnh file đã chọn.")
+        self._reset_video_marker_state()
+
+    def choose_video(self):
+        path = filedialog.askopenfilename(parent=self.root, filetypes=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm"), ("Tất cả", "*.*")])
+        if path:
+            self.video_path.set(path)
+            self.inspect_video()
 
     def inspect_video(self):
-        path = self.video_path.get().strip()
-        if not path:
+        if self.busy:
+            raise RuntimeError("Hãy chờ tác vụ hiện tại hoàn tất trước khi mở video.")
+        source = self.video_path.get().strip()
+        if not source:
             raise ValueError("Hãy chọn video đầu vào.")
-        def run():
-            from apps.video_editor import probe_video
-            with self.tool.operation(require_model=False):
-                self.tool.check_stop()
-                return probe_video(path)
-        def done(info):
-            self.video_details.set(f"{info['width']} × {info['height']} · {info['fps']:g} FPS · "
-                                   f"{info['duration']:.3f} giây · {'có tiếng gốc' if info['has_audio'] else 'không có tiếng gốc'}")
-            self.video_start.set("0")
-            self.video_end.set(f"{info['duration']:.6f}")
-            self.video_ramp.set(str(min(0.5, info["duration"] / 2)))
-            self.status.set("Đã đọc thông tin video. Chọn mốc bắt đầu/kết thúc để đổi tốc độ một đoạn.")
-        self._job(run, done)
+        path = Path(source).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError("Không tìm thấy video đầu vào.")
+        self._video_open_path = path
+        self.video_details.set("Đang mở video…")
+        self.video_preview.open(path, on_loaded=self._video_loaded, on_error=self._video_error)
+
+    def _video_loaded(self, info):
+        self._reset_video_marker_state()
+        self.video_duration = float(info["duration"])
+        self.video_segments = []
+        self.video_selected = None
+        self.video_timeline.set_video(self.video_duration)
+        self.video_start.set("0")
+        self.video_end.set(f"{min(10, self.video_duration):.6f}")
+        self.video_ramp.set(f"{min(0.5, self.video_duration / 2):g}")
+        self.video_play_button.configure(state="normal")
+        self.video_details.set(f"{info['width']} × {info['height']} · {info['fps']:g} FPS · "
+                               f"{self.video_duration:.2f}s · {'có âm thanh' if info['has_audio'] else 'không có âm thanh'}")
+        self._refresh_video_segments()
+        self.status.set("Video đã mở. Kéo chọn vùng trên timeline rồi bấm Thêm đoạn.")
+
+    def _video_error(self, message):
+        self.video_play_button.configure(state="normal" if self.video_preview.ready else "disabled", text="▶ Phát")
+        self.video_details.set(str(message))
+        self.status.set(str(message))
+        self._log(str(message))
+
+    def _video_position(self, seconds, playing):
+        self.video_timeline.set_position(seconds)
+        if self.video_marker_mapping is not None:
+            output = float(self.video_marker_mapping.output_time(seconds))
+            self.video_time.set(f"Gốc {time_label(seconds)} · Mới {time_label(output)}")
+        else:
+            self.video_time.set(f"{time_label(seconds)} / {time_label(self.video_duration)}")
+        self.video_play_button.configure(text="Ⅱ Tạm dừng" if playing else "▶ Phát")
+
+    def toggle_video_play(self):
+        if self.busy:
+            raise RuntimeError("Hãy chờ xuất video hoàn tất trước khi xem trước.")
+        if self.video_preview.playing:
+            self.video_preview.pause()
+        else:
+            self.video_preview.play()
+
+    def _video_seek(self, seconds):
+        self.video_preview.seek(seconds)
+
+    def _video_select(self, start, end, index):
+        self.video_selected = index
+        self.video_start.set(f"{start:.6f}")
+        self.video_end.set(f"{end:.6f}")
+        self.video_selection_label.set(f"Đoạn {index + 1}" if index is not None else "Đoạn mới · bấm Thêm đoạn")
+        previous_sync = self._video_sync
+        self._video_sync = True
+        try:
+            if index is not None:
+                segment = self.video_timeline.segments[index]
+                self.video_speed.set(f"{segment.speed:g}")
+                self.video_ramp.set(f"{segment.ramp_seconds:g}")
+                self.video_speed_slider.set(segment.speed)
+                self.video_segment_list.selection_set(str(index))
+            else:
+                self.video_segment_list.selection_remove(*self.video_segment_list.selection())
+                try:
+                    self.video_ramp.set(f"{min(float(self.video_ramp.get()), (end - start) / 2):g}")
+                except ValueError:
+                    self.video_ramp.set("0")
+                self.video_preview.seek(start)
+        finally:
+            self._video_sync = previous_sync
+
+    def _video_segments_changed(self, segments, index):
+        self._ensure_video_manual_edit()
+        self.video_segments = list(segments)
+        self.video_selected = index
+        self._refresh_video_segments()
+
+    def _video_speed_drag(self, value):
+        if self._video_sync or self.video_marker_mapping is not None:
+            return
+        speed = round(float(value), 2)
+        self.video_speed.set(f"{speed:.2f}")
+        if self.video_selected is not None and not self.busy:
+            # Keep exact timeline endpoints, including adjacent fractional ranges.
+            original = self.video_segments[self.video_selected]
+            self.video_segments[self.video_selected] = SpeedSegment(
+                original.start, original.end, speed, original.ramp_seconds)
+            self._refresh_video_segments()
+
+    def _video_list_select(self, event=None):
+        if self._video_sync:
+            return
+        selection = self.video_segment_list.selection()
+        if selection:
+            index = int(selection[0])
+            if index == self.video_selected:
+                return
+            self.video_timeline.set_segments(self.video_segments, index)
+            segment = self.video_segments[index]
+            self._video_select(segment.start, segment.end, index)
+
+    def _video_form_segment(self):
+        self._ensure_video_manual_edit()
+        if not self.video_duration:
+            raise ValueError("Hãy mở video trước khi thêm đoạn tốc độ.")
+        variables = (self.video_start, self.video_end, self.video_speed, self.video_ramp)
+        values = [float(variable.get()) for variable in variables]
+        if self.video_selected is not None:
+            original = self.video_segments[self.video_selected]
+            exact = (original.start, original.end, original.speed, original.ramp_seconds)
+            displayed = (f"{exact[0]:.6f}", f"{exact[1]:.6f}", f"{exact[2]:g}", f"{exact[3]:g}")
+            values = [old if variable.get() == label else value
+                      for variable, value, old, label in zip(variables, values, exact, displayed)]
+        start, end, speed, ramp = values
+        segment = SpeedSegment(start, end, speed, ramp)
+        build_multi_speed_time_map(self.video_duration, [segment])
+        return segment
+
+    def add_video_segment(self):
+        segment = self._video_form_segment()
+        segments = [*self.video_segments, segment]
+        build_multi_speed_time_map(self.video_duration, segments)
+        self.video_segments = sorted(segments, key=lambda item: item.start)
+        self.video_selected = self.video_segments.index(segment)
+        self._refresh_video_segments()
+
+    def apply_video_segment(self):
+        if self.video_selected is None:
+            raise ValueError("Chọn một đoạn đã thêm trước khi áp dụng thay đổi.")
+        segment = self._video_form_segment()
+        segments = list(self.video_segments)
+        segments[self.video_selected] = segment
+        build_multi_speed_time_map(self.video_duration, segments)
+        self.video_segments = sorted(segments, key=lambda item: item.start)
+        self.video_selected = self.video_segments.index(segment)
+        self._refresh_video_segments()
+
+    def delete_video_segment(self):
+        self._ensure_video_manual_edit()
+        if self.video_selected is None:
+            raise ValueError("Chọn đoạn muốn xóa trên timeline hoặc trong danh sách.")
+        self.video_segments.pop(self.video_selected)
+        self.video_selected = None
+        self._refresh_video_segments()
+
+    def clear_video_segments(self):
+        self._ensure_video_manual_edit()
+        self.video_segments = []
+        self.video_selected = None
+        self._refresh_video_segments()
+
+    def _refresh_video_segments(self):
+        self.video_timeline.set_segments(self.video_segments, self.video_selected)
+        self.video_timeline.set_markers(self.video_old_markers, self.video_new_markers)
+        self._update_video_edit_mode()
+        if self.video_marker_mapping is not None:
+            self.video_preview.set_time_map(self.video_marker_mapping)
+        else:
+            self.video_preview.set_segments(tuple(self.video_segments))
+        self._video_sync = True
+        try:
+            self.video_segment_list.delete(*self.video_segment_list.get_children())
+            for index, segment in enumerate(self.video_segments):
+                self.video_segment_list.insert("", "end", iid=str(index),
+                                               values=(f"{segment.start:.2f}–{segment.end:.2f}", f"{segment.speed:g}x"))
+            if self.video_selected is not None:
+                segment = self.video_segments[self.video_selected]
+                self._video_select(segment.start, segment.end, self.video_selected)
+            else:
+                self.video_selection_label.set("Chọn đoạn trên timeline")
+        finally:
+            self._video_sync = False
+        if self.video_duration:
+            mapping = self.video_marker_mapping or build_multi_speed_time_map(self.video_duration, self.video_segments)
+            label = f"{len(self.video_old_markers)} mốc đã căn" if self.video_marker_mapping else f"{len(self.video_segments)} đoạn"
+            self.video_output_duration.set(f"{label} · video xuất {mapping.output_duration:.3f}s")
+
+    def _ensure_video_manual_edit(self):
+        if self.busy:
+            raise RuntimeError("Hãy chờ tác vụ hiện tại hoàn tất trước khi chỉnh đoạn.")
+        if self.video_marker_mapping is not None:
+            raise ValueError("Bấm Bỏ căn trước khi chỉnh tốc độ bằng tay để giữ đúng các mốc mới.")
+
+    def _update_video_edit_mode(self):
+        locked = self.video_marker_mapping is not None
+        self.video_timeline.set_editable(not locked)
+        state = "disabled" if locked or self.busy else "normal"
+        for widget in [*self.video_manual_fields, self.video_speed_control, *self.video_manual_buttons]:
+            widget.configure(state=state)
+
+    def _reset_video_marker_state(self):
+        self.video_old_markers = ()
+        self.video_new_markers = ()
+        self.video_marker_mapping = None
+        self._video_manual_segments = None
+        self.video_old_marks_path.set("")
+        self.video_new_marks_path.set("")
+        self.video_marker_table.delete(*self.video_marker_table.get_children())
+        self.video_marker_status.set("Nhập hai file số thứ tự + HH:MM:SS,mmm")
+        self.video_timeline.set_markers(())
+        self._update_video_edit_mode()
+
+    def import_video_markers(self, kind="old"):
+        if self.busy:
+            raise RuntimeError("Hãy chờ tác vụ hiện tại hoàn tất trước khi nhập mốc.")
+        if not self.video_duration:
+            raise ValueError("Hãy mở video trước khi nhập các mốc thời gian.")
+        if kind not in ("old", "new"):
+            raise ValueError("Chọn file mốc cũ hoặc mốc mới.")
+        label = "cũ" if kind == "old" else "mới"
+        path = filedialog.askopenfilename(parent=self.root, title=f"Chọn file mốc {label}",
+                                         filetypes=[("File mốc thời gian", "*.txt *.srt"), ("Tất cả", "*.*")])
+        if not path:
+            return
+        markers = read_marker_file(path)
+        if kind == "old" and markers[-1].time_ms / 1000 > self.video_duration:
+            raise ValueError("Mốc cũ vượt thời lượng video đang mở.")
+        # Parse and validate before changing an already applied alignment.
+        if self.video_marker_mapping is not None:
+            self.clear_video_marker_alignment()
+        if kind == "old":
+            self.video_old_markers = markers
+            self.video_old_marks_path.set(str(path))
+        else:
+            self.video_new_markers = markers
+            self.video_new_marks_path.set(str(path))
+        self.video_timeline.set_markers(self.video_old_markers, self.video_new_markers)
+        self._refresh_video_marker_rows()
+        self.status.set(f"Đã nhập {len(markers)} mốc {label}. Nhập đủ hai file rồi bấm Căn theo mốc.")
+
+    def _refresh_video_marker_rows(self):
+        old_by_id = {marker.index: marker for marker in self.video_old_markers}
+        new_by_id = {marker.index: marker for marker in self.video_new_markers}
+        self.video_marker_table.delete(*self.video_marker_table.get_children())
+        rows = list(self.video_old_markers or self.video_new_markers)
+        def label(marker):
+            if marker is None:
+                return "—"
+            return f"{marker.time_ms // 1000}.{marker.time_ms % 1000:03d}"
+        for marker in rows:
+            self.video_marker_table.insert("", "end", iid=str(marker.index),
+                                           values=(marker.index, label(old_by_id.get(marker.index)),
+                                                   label(new_by_id.get(marker.index))))
+        old_name = Path(self.video_old_marks_path.get()).name or "chưa chọn"
+        new_name = Path(self.video_new_marks_path.get()).name or "chưa chọn"
+        applied = "Đã căn theo mốc · đuôi giữ 1x" if self.video_marker_mapping else "Chưa áp dụng căn mốc"
+        self.video_marker_status.set(f"Cũ: {old_name} ({len(self.video_old_markers)})\n"
+                                     f"Mới: {new_name} ({len(self.video_new_markers)})\n{applied}")
+
+    def _video_marker_selected(self, event=None):
+        selected = self.video_marker_table.selection()
+        if selected:
+            index = int(selected[0])
+            marker = next((item for item in self.video_old_markers if item.index == index), None)
+            if marker is not None:
+                self.video_preview.seek(marker.time_ms / 1000)
+
+    def align_video_markers(self):
+        if self.busy:
+            raise RuntimeError("Hãy chờ tác vụ hiện tại hoàn tất trước khi căn mốc.")
+        if not self.video_duration:
+            raise ValueError("Hãy mở video trước khi căn các mốc thời gian.")
+        if not self.video_preview.ready:
+            raise ValueError("Video chưa sẵn sàng để xem trước. Hãy mở lại video rồi căn mốc.")
+        mapping = build_marker_time_map(self.video_duration, self.video_old_markers, self.video_new_markers)
+        if self.video_marker_mapping is None:
+            self._video_manual_segments = tuple(self.video_segments)
+        self.video_marker_mapping = mapping
+        self.video_segments = list(mapping.segments)
+        self.video_selected = None
+        self._refresh_video_segments()
+        self._refresh_video_marker_rows()
+        self._video_position(self.video_preview.position, self.video_preview.playing)
+        self.status.set(f"Đã căn {len(mapping.old_markers)} mốc · phần đuôi giữ 1x. Phát để xem trước rồi Xuất video.")
+
+    def clear_video_marker_alignment(self):
+        if self.busy:
+            raise RuntimeError("Hãy chờ tác vụ hiện tại hoàn tất trước khi bỏ căn mốc.")
+        if self.video_marker_mapping is not None:
+            self.video_segments = list(self._video_manual_segments or ())
+            self.video_marker_mapping = None
+            self._video_manual_segments = None
+            self.video_selected = None
+            self._refresh_video_segments()
+            self._video_position(self.video_preview.position, self.video_preview.playing)
+        self._refresh_video_marker_rows()
+        self.status.set("Đã bỏ căn mốc và khôi phục các đoạn chỉnh tay; các file mốc vẫn được giữ.")
 
     def export_video(self):
         path = self.video_path.get().strip()
         if not path:
             raise ValueError("Hãy chọn video đầu vào.")
-        start, end, speed, ramp = (float(variable.get()) for variable in
-                                  (self.video_start, self.video_end, self.video_speed, self.video_ramp))
-        if not all(math.isfinite(value) for value in (start, end, speed, ramp)):
-            raise ValueError("Mốc thời gian và tốc độ video phải là số hữu hạn.")
-        if start < 0 or end <= start or not 0.25 <= speed <= 4 or not 0 <= ramp <= (end - start) / 2:
-            raise ValueError("Kiểm tra mốc bắt đầu/kết thúc, tốc độ 0.25–4.0x và thời gian chuyển không vượt nửa đoạn.")
+        if not self.video_segments:
+            raise ValueError("Hãy thêm ít nhất một đoạn tốc độ trên timeline.")
+        segments = tuple(self.video_segments)
         quality, preset, keep_audio = int(self.video_quality.get()), self.video_preset.get(), self.video_keep_audio.get()
-        self._job(lambda: self.tool.edit_video(path, start, end, speed=speed, ramp_seconds=ramp,
-                  keep_audio=keep_audio, quality=quality, preset=preset,
-                  progress=lambda fraction: self._post("status", f"Đang xử lý video · {fraction * 100:.0f}%")), self._result)
+        self.video_preview.pause()
+        started = time.monotonic()
+        last_update, last_stage = 0.0, ""
+
+        def progress(fraction):
+            nonlocal last_update, last_stage
+            now = time.monotonic()
+            stage = ("Chuẩn bị xuất video" if fraction == 0 else
+                     "Xử lý âm thanh" if fraction < 0.25 else
+                     "Mã hóa video" if fraction < 1 else "Xuất video hoàn tất")
+            if stage != last_stage or fraction >= 1 or now - last_update >= 0.2:
+                self._post("status", f"{stage} · {fraction * 100:.0f}% · đã chạy {now - started:.0f}s")
+                last_update, last_stage = now, stage
+        if self.video_marker_mapping is not None:
+            old, new = tuple(self.video_old_markers), tuple(self.video_new_markers)
+            self._job(lambda: self.tool.edit_video_markers(path, old, new, keep_audio=keep_audio,
+                                                          quality=quality, preset=preset, progress=progress), self._result)
+        else:
+            self._job(lambda: self.tool.edit_video_segments(path, segments, keep_audio=keep_audio,
+                                                           quality=quality, preset=preset, progress=progress), self._result)
 
     def _tools_tab(self):
         tab = self._tab("Fine-tune / API", scroll=True)
@@ -719,9 +1111,11 @@ class DesktopApp:
                 self._log(value)
             elif kind == "done":
                 self.busy = False
+                self.video_timeline.enabled = True
                 self.progress.stop()
                 for button in self.action_buttons:
                     button.configure(state="normal")
+                self._update_video_edit_mode()
                 result, callback, error = value
                 self.refresh_voices()
                 if error:
@@ -742,6 +1136,8 @@ class DesktopApp:
         if self.api_process is not None and self.api_process.poll() is None:
             raise RuntimeError("Hãy dừng API trước khi chạy tác vụ desktop.")
         self.busy = True
+        self.video_preview.pause()
+        self.video_timeline.enabled = False
         self.tool.stop_event.clear()
         self.progress.start(12)
         for button in self.action_buttons:
@@ -1060,6 +1456,7 @@ class DesktopApp:
 
     def stop(self):
         self.tool.stop()
+        self.video_preview.pause()
         if self.player is not None:
             self.player.stop()
         if self.job_process is not None and self.job_process.poll() is None:
@@ -1147,6 +1544,7 @@ class DesktopApp:
         if self.closed:
             return
         self.closed = True
+        self.video_preview.close()
         self.root.after_cancel(self._drain_handle)
         self.stop()
         self._terminate_children()
