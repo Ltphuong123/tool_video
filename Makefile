@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help setup setup-gpu setup-cpu setup-finetune demo run stream docker-cpu docker-gpu docker-build-cpu docker-build-gpu check clean
+.PHONY: help setup setup-gpu setup-cpu setup-finetune demo run stream desktop docker-cpu docker-gpu docker-build-cpu docker-build-gpu check clean
 
 help:
 	@echo "Targets:"
@@ -9,6 +9,7 @@ help:
 	@echo "  make setup-gpu      - + torch/transformers: v3 Turbo on CUDA (uv sync --extra cuda)"
 	@echo "  make setup-finetune - + peft/accelerate: LoRA fine-tuning (uv sync --extra finetune)"
 	@echo "  make run            - run Gradio UI (alias for 'make demo')"
+	@echo "  make desktop        - run v3 Turbo desktop studio (Tkinter)"
 	@echo "  make stream         - run legacy Web Stream UI (v1 CPU GGUF)"
 	@echo "  make docker-cpu     - docker compose --profile cpu (Web UI, torch-free)"
 	@echo "  make docker-gpu     - docker compose --profile gpu (Web UI, CUDA)"
@@ -115,6 +116,9 @@ demo:
 	uv run vieneu-web
 
 run: demo
+
+desktop:
+	uv run --extra srt-quality python v3turbo_desktop.py
 
 stream:
 	uv run vieneu-stream

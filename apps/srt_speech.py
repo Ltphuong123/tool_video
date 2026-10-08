@@ -42,34 +42,46 @@ def _ms(m: re.Match) -> int:
     return ((int(h) * 60 + int(mi)) * 60 + int(s)) * 1000 + int(frac)
 
 
-def parse_srt(text: str) -> list[Cue]:
-    """Tolerant .srt parser: blank-line separated blocks, optional index line,
+def parse_srt(text: str, *, strict_timing: bool = False) -> list[Cue]:
+    """Tolerant .srt parser: timestamp-delimited cues, optional index line,
     `HH:MM:SS,mmm --> HH:MM:SS,mmm`, then one or more text lines. HTML/ASS
-    tags are stripped; empty cues are dropped; cues come back sorted by start."""
+    tags are stripped; empty cues are dropped; cues come back sorted by start.
+    ``strict_timing`` rejects invalid ends and preserves windows under 100 ms.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    lines = [line.strip() for line in text.split("\n")]
+    headers = []
+    for position, line in enumerate(lines):
+        if "-->" not in line:
+            continue
+        before, after = line.split("-->", 1)
+        begin, end = _TIME.search(before), _TIME.search(after)
+        if begin and end:
+            headers.append((position, _ms(begin), _ms(end)))
     cues: list[Cue] = []
-    for block in re.split(r"\n\s*\n", text.strip()):
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-        if not lines:
-            continue
-        ti = next((i for i, l in enumerate(lines) if "-->" in l), None)
-        if ti is None:
-            continue
-        times = _TIME.findall(lines[ti])
-        if len(times) < 2:
-            continue
-        a, b = (_ms(_TIME.search(lines[ti])), None)
-        # second timestamp: search after the arrow
-        after = lines[ti].split("-->", 1)[1]
-        mb = _TIME.search(after)
-        if not mb:
-            continue
-        b = _ms(mb)
-        body = " ".join(_TAG.sub("", l) for l in lines[ti + 1:]).strip()
+    current_index = (int(lines[headers[0][0] - 1])
+                     if headers and headers[0][0] > 0 and lines[headers[0][0] - 1].isdigit() else None)
+    for index, (position, a, b) in enumerate(headers):
+        next_position = headers[index + 1][0] if index + 1 < len(headers) else len(lines)
+        body_end = next_position
+        next_index = None
+        if index + 1 < len(headers) and lines[next_position - 1].isdigit():
+            # A numeric line immediately before the next timestamp is its cue
+            # index when separated by a blank line, or when the file has indices.
+            has_current_index = current_index is not None
+            separated_index = next_position > 1 and not lines[next_position - 2]
+            if has_current_index or separated_index:
+                body_end -= 1
+                next_index = int(lines[next_position - 1])
+        current_index = next_index
+        body = " ".join(_TAG.sub("", line) for line in lines[position + 1:body_end]).strip()
         body = re.sub(r"\s+", " ", body)
         if not body:
             continue
-        cues.append(Cue(index=len(cues) + 1, start_ms=a, end_ms=max(b, a + 100), text=body))
+        if strict_timing and b <= a:
+            raise ValueError(f"Câu SRT {len(cues) + 1}: thời gian kết thúc phải sau thời gian bắt đầu.")
+        end_ms = b if strict_timing else max(b, a + 100)
+        cues.append(Cue(index=len(cues) + 1, start_ms=a, end_ms=end_ms, text=body))
     cues.sort(key=lambda c: c.start_ms)
     for i, c in enumerate(cues):
         c.index = i + 1

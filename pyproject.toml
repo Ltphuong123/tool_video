@@ -62,7 +62,8 @@ keywords = [
 authors = [
     { name = "Phạm Nguyễn Ngọc Bảo", email = "pnnbao@gmail.com" }
 ]
-requires-python = ">=3.10"
+# The pinned CUDA torch 2.8.0 wheels support Python 3.10–3.13.
+requires-python = ">=3.10,<3.14"
 # Minimal, TORCH-FREE core. `pip install vieneu` runs VieNeu-TTS v3 Turbo on CPU
 # via ONNX Runtime. GPU (v3 Turbo PyTorch backend): `pip install vieneu[cuda]`;
 # legacy backends (llama-cpp, lmdeploy, librosa, neucodec) live in the [legacy] extra.
@@ -92,6 +93,10 @@ dependencies = [
 "Changelog" = "https://github.com/pnnbao97/VieNeu-TTS/releases"
 
 [project.optional-dependencies]
+srt-quality = [
+    "pedalboard>=0.9.26,<0.10", # Rubber Band for all desktop tempo processing
+]
+
 legacy = [
     "torch",
     "torchaudio",
@@ -161,6 +166,7 @@ pythonpath = ["src"]
 [project.scripts]
 vieneu-web = "apps.gradio_main:main"
 vieneu-stream = "apps.web_stream:main"
+vieneu-desktop = "apps.v3turbo_desktop:main"
 
 [tool.setuptools]
 package-dir = {"" = "src", "apps" = "apps", "examples" = "examples"}
