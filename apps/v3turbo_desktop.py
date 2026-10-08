@@ -5,6 +5,7 @@ import argparse
 import atexit
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -121,6 +122,7 @@ class DesktopApp:
         self._batch_tab()
         self._conversation_tab()
         self._srt_tab()
+        self._video_tab()
         self._tools_tab()
         self._history_tab()
         footer = ttk.Frame(body, padding=(15, 10))
@@ -140,13 +142,13 @@ class DesktopApp:
         frame = ttk.Frame(self.book)
         self.book.add(frame, text=title)
         self.pages[title] = frame
-        labels = {"Văn bản": "01   Đọc văn bản", "SRT": "02   Đọc phụ đề SRT", "Hàng loạt": "03   Tạo hàng loạt",
-                  "Hội thoại": "04   Hội thoại", "Clone / Giọng": "05   Thư viện giọng", "Kết quả / Log": "06   Lịch sử & file",
-                  "Cấu hình": "07   Cấu hình", "Fine-tune / API": "08   Fine-tune & API"}
+        labels = {"Văn bản": "01   Đọc văn bản", "SRT": "02   Đọc phụ đề SRT", "Video": "03   Chỉnh tốc độ video",
+                  "Hàng loạt": "04   Tạo hàng loạt", "Hội thoại": "05   Hội thoại", "Clone / Giọng": "06   Thư viện giọng",
+                  "Kết quả / Log": "07   Lịch sử & file", "Cấu hình": "08   Cấu hình", "Fine-tune / API": "09   Fine-tune & API"}
         button = ttk.Button(self.navigation, text=labels[title], style="Nav.TButton", command=lambda: self.book.select(frame))
         self.nav_buttons[title] = button
         # The visual order follows the workflow, independent of widget creation.
-        order = ["Văn bản", "SRT", "Hàng loạt", "Hội thoại", "Clone / Giọng", "Kết quả / Log", "Cấu hình", "Fine-tune / API"]
+        order = ["Văn bản", "SRT", "Video", "Hàng loạt", "Hội thoại", "Clone / Giọng", "Kết quả / Log", "Cấu hình", "Fine-tune / API"]
         for key in order:
             if key in self.nav_buttons:
                 self.nav_buttons[key].pack_forget()
@@ -179,6 +181,7 @@ class DesktopApp:
     def _page_changed(self, event=None):
         current = self.book.select()
         captions = {"Văn bản": "Viết nội dung, chọn giọng và tạo audio.", "SRT": "Giữ mốc phụ đề, tự căn tốc độ từng câu.",
+                    "Video": "Đổi tốc độ một đoạn, chuyển êm ở hai đầu và giữ đồng bộ âm thanh.",
                     "Hàng loạt": "Tạo nhiều audio trong một lượt và xuất ZIP.", "Hội thoại": "Gán giọng theo nhân vật và điều chỉnh khoảng nghỉ.",
                     "Clone / Giọng": "Tạo và quản lý thư viện giọng riêng.", "Kết quả / Log": "Tìm, nghe, lưu bản sao và quản lý file đã tạo.",
                     "Cấu hình": "Model, thiết bị, tham số đọc và nơi lưu kết quả.", "Fine-tune / API": "Huấn luyện giọng và chạy API trên máy."}
@@ -421,6 +424,107 @@ class DesktopApp:
         row.pack(fill="x")
         self._button(row, "Tạo audio từ SRT", self.srt, primary=True)
 
+    def _video_tab(self):
+        tab = self._tab("Video", scroll=True)
+        self.video_path = self._path_field(tab, "Video đầu vào", types=[("Video", "*.mp4 *.mov *.mkv *.avi *.webm"), ("Tất cả", "*.*")])
+        self.video_details = tk.StringVar(value="Chọn video, rồi đọc thông tin để xem thời lượng và FPS.")
+        ttk.Label(tab, textvariable=self.video_details, style="Muted.TLabel", wraplength=700).pack(anchor="w", pady=(4, 6))
+        row = ttk.Frame(tab)
+        row.pack(fill="x")
+        self._button(row, "Đọc thông tin video", self.inspect_video)
+        settings = ttk.LabelFrame(tab, text="Đoạn cần thay đổi tốc độ", padding=14)
+        settings.pack(fill="x", pady=(12, 10))
+        self.video_start, _, _ = self._field(settings, "Bắt đầu trong video gốc (s)", 0)
+        self.video_end, _, _ = self._field(settings, "Kết thúc trong video gốc (s)", 10)
+        self.video_speed, _, _ = self._field(settings, "Tốc độ đoạn (0.25–4.0x)", 1.5)
+        self.video_ramp, _, _ = self._field(settings, "Chuyển tốc độ mỗi đầu (s)", 0.5)
+        self.video_curve = tk.Canvas(settings, height=95, background="#f8faff", highlightthickness=0)
+        self.video_curve.pack(fill="x", pady=(10, 0))
+        self.video_curve.bind("<Configure>", lambda event: self._draw_video_curve())
+        for variable in (self.video_start, self.video_end, self.video_speed, self.video_ramp):
+            variable.trace_add("write", lambda *_: self._draw_video_curve())
+        self.video_keep_audio = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab, text="Giữ tiếng gốc và đổi tốc độ đồng bộ · Rubber Band giữ cao độ",
+                        variable=self.video_keep_audio).pack(anchor="w", pady=6)
+        self.video_quality, _, _ = self._field(tab, "Chất lượng MP4 · CRF", 20, ["18", "20", "23", "26", "28"])
+        self.video_preset, _, _ = self._field(tab, "Tốc độ xuất video", "fast", ["faster", "fast", "medium"])
+        ttk.Label(tab, text="Mốc và thời gian chuyển tính theo video gốc. Chuyển 0 giây để đổi ngay; "
+                  "tối đa nửa độ dài đoạn. Các phần khác giữ tốc độ 1.0x.\n"
+                  "Độ mượt khi làm chậm phụ thuộc FPS của nguồn.\n"
+                  "Xuất MP4 mới trong nơi lưu đang chọn; video đầu vào được giữ lại. Không cần tải model TTS.",
+                  wraplength=700, style="Muted.TLabel").pack(anchor="w", pady=(10, 4))
+        page = self.pages["Video"]
+        row = ttk.Frame(page, padding=(16, 4))
+        row.pack(side="bottom", fill="x", before=page.winfo_children()[0])
+        self.video_export_button = self._button(row, "Xuất video", self.export_video, primary=True)
+
+    def _draw_video_curve(self):
+        canvas = self.video_curve
+        canvas.delete("all")
+        width = max(240, canvas.winfo_width())
+        try:
+            start, end, speed, ramp = (float(variable.get()) for variable in
+                                       (self.video_start, self.video_end, self.video_speed, self.video_ramp))
+            if not all(math.isfinite(value) for value in (start, end, speed, ramp)) or end <= start or speed <= 0:
+                return
+        except ValueError:
+            return
+        fraction = min(0.5, max(0, ramp / (end - start)))
+        low, high = min(1, speed), max(1, speed)
+        span = max(0.5, high - low)
+        def y(value):
+            return 62 - (value - low) / span * 40
+        coordinates = []
+        for index in range(161):
+            position = index / 160
+            local = (position - 0.15) / 0.7
+            if local < 0 or local > 1:
+                value = 1
+            elif fraction and (local < fraction or local > 1 - fraction):
+                amount = min(local, 1 - local) / fraction
+                value = 1 + (speed - 1) * amount * amount * (3 - 2 * amount)
+            else:
+                value = speed
+            coordinates.extend((16 + position * (width - 32), y(value)))
+        canvas.create_line(16, y(1), width - 16, y(1), fill="#d7dfea", dash=(3, 3))
+        canvas.create_line(*coordinates, fill="#5b48ef", width=2, smooth=False)
+        canvas.create_text(20, 83, text="1.0x", anchor="w", fill="#64718a", font=("Segoe UI", 9))
+        canvas.create_text(width / 2, 83, text=f"Đoạn đã chọn · {speed:g}x", fill="#5b48ef", font=("Segoe UI", 9))
+        canvas.create_text(width - 20, 83, text="1.0x", anchor="e", fill="#64718a", font=("Segoe UI", 9))
+
+    def inspect_video(self):
+        path = self.video_path.get().strip()
+        if not path:
+            raise ValueError("Hãy chọn video đầu vào.")
+        def run():
+            from apps.video_editor import probe_video
+            with self.tool.operation(require_model=False):
+                self.tool.check_stop()
+                return probe_video(path)
+        def done(info):
+            self.video_details.set(f"{info['width']} × {info['height']} · {info['fps']:g} FPS · "
+                                   f"{info['duration']:.3f} giây · {'có tiếng gốc' if info['has_audio'] else 'không có tiếng gốc'}")
+            self.video_start.set("0")
+            self.video_end.set(f"{info['duration']:.6f}")
+            self.video_ramp.set(str(min(0.5, info["duration"] / 2)))
+            self.status.set("Đã đọc thông tin video. Chọn mốc bắt đầu/kết thúc để đổi tốc độ một đoạn.")
+        self._job(run, done)
+
+    def export_video(self):
+        path = self.video_path.get().strip()
+        if not path:
+            raise ValueError("Hãy chọn video đầu vào.")
+        start, end, speed, ramp = (float(variable.get()) for variable in
+                                  (self.video_start, self.video_end, self.video_speed, self.video_ramp))
+        if not all(math.isfinite(value) for value in (start, end, speed, ramp)):
+            raise ValueError("Mốc thời gian và tốc độ video phải là số hữu hạn.")
+        if start < 0 or end <= start or not 0.25 <= speed <= 4 or not 0 <= ramp <= (end - start) / 2:
+            raise ValueError("Kiểm tra mốc bắt đầu/kết thúc, tốc độ 0.25–4.0x và thời gian chuyển không vượt nửa đoạn.")
+        quality, preset, keep_audio = int(self.video_quality.get()), self.video_preset.get(), self.video_keep_audio.get()
+        self._job(lambda: self.tool.edit_video(path, start, end, speed=speed, ramp_seconds=ramp,
+                  keep_audio=keep_audio, quality=quality, preset=preset,
+                  progress=lambda fraction: self._post("status", f"Đang xử lý video · {fraction * 100:.0f}%")), self._result)
+
     def _tools_tab(self):
         tab = self._tab("Fine-tune / API", scroll=True)
         ttk.Label(tab, text="Fine-tune một giọng bằng LoRA", font=("Segoe UI", 12, "bold")).pack(anchor="w")
@@ -489,7 +593,7 @@ class DesktopApp:
         detail.pack(side="bottom", anchor="w", pady=8, before=table)
         actions = ttk.Frame(results)
         actions.pack(side="bottom", fill="x", before=detail)
-        self._button(actions, "Nghe", self.play_selected, primary=True)
+        self._button(actions, "Mở / nghe", self.play_selected, primary=True)
         self._button(actions, "Lưu thành…", self.save_selected)
         self._button(actions, "Lưu cặp audio + SRT…", self.save_subtitle_pair)
         ttk.Button(actions, text="Mở thư mục file", command=lambda: self._guard(self.open_selected_folder)).pack(side="left", padx=5)
@@ -975,6 +1079,10 @@ class DesktopApp:
 
     def play_selected(self):
         path = self._selected()
+        if path.suffix.lower() == ".mp4":
+            self._open_file(path)
+            self.status.set(f"Đã mở video: {path.name}")
+            return
         if path.suffix not in (".wav", ".flac", ".mp3"):
             raise ValueError("Chọn file audio để nghe.")
         def run():
@@ -1021,6 +1129,10 @@ class DesktopApp:
 
     @staticmethod
     def _open_folder(path):
+        DesktopApp._open_file(path)
+
+    @staticmethod
+    def _open_file(path):
         if os.name == "nt":
             os.startfile(path)
         else:

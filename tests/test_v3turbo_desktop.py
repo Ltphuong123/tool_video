@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 import importlib.util
 from unittest.mock import patch
@@ -125,6 +126,119 @@ class DesktopToolTests(unittest.TestCase):
         self.assertNotIn(self.tool.voices_path, paths)
         self.assertTrue(all(row.size == row.path.stat().st_size for row in rows))
         self.assertEqual([row.modified for row in rows], sorted((row.modified for row in rows), reverse=True))
+
+    def test_video_export_uses_current_destination_and_preserves_source_without_a_model(self):
+        source = self.folder / "original video.mp4"
+        source.write_bytes(b"original video bytes")
+        destination = self.folder / "video exports"
+        tool = TurboTool(self.folder, factory=FakeTurbo)
+        tool.set_output_dir(destination)
+        messages = []
+        def render(input_path, output_path, start, end, **kwargs):
+            self.assertEqual(Path(input_path), source)
+            self.assertEqual(Path(output_path).parent, destination)
+            self.assertEqual((start, end), (2.5, 8.75))
+            self.assertEqual(kwargs["speed"], 0.8)
+            self.assertEqual(kwargs["ramp_seconds"], 1.0)
+            self.assertTrue(kwargs["keep_audio"])
+            self.assertEqual(kwargs["quality"], 20)
+            self.assertEqual(kwargs["preset"], "fast")
+            self.assertTrue(callable(kwargs["check_stop"]))
+            kwargs["check_stop"]()
+            kwargs["progress"](0.5)
+            Path(output_path).write_bytes(b"rendered MP4")
+            return SimpleNamespace(output_duration=21.5)
+        with patch("apps.video_editor.render_speed_segment", side_effect=render) as backend, \
+             patch.object(tool, "load") as load:
+            result, note = tool.edit_video(source, 2.5, 8.75, speed=0.8,
+                                          ramp_seconds=1.0, keep_audio=True, progress=messages.append)
+        backend.assert_called_once()
+        load.assert_not_called()
+        self.assertIsNone(tool.tts)
+        self.assertTrue(result.is_file())
+        self.assertEqual(result.read_bytes(), b"rendered MP4")
+        self.assertEqual(source.read_bytes(), b"original video bytes")
+        self.assertTrue(note)
+        self.assertTrue(messages)
+        rows = tool.list_outputs()
+        self.assertEqual([(row.path, row.kind) for row in rows], [(result, "Video")])
+
+    def test_video_history_only_accepts_generated_mp4_names_and_deletion_preserves_source(self):
+        accepted = self.folder / "VIDEO_123456789ABC.MP4"
+        accepted.write_bytes(b"generated video")
+        rejected = [self.folder / "input.mp4", self.folder / "speech_123456789abc.mp4",
+                    self.folder / "video_bad.mp4", self.folder / "video_123456789abc.wav"]
+        for path in rejected:
+            path.write_bytes(b"input file")
+        rows = self.tool.list_outputs()
+        self.assertIn((accepted, "Video"), [(row.path, row.kind) for row in rows])
+        self.assertTrue(set(rejected).isdisjoint(row.path for row in rows))
+        with self.assertRaises(ValueError):
+            self.tool.delete_outputs([accepted, rejected[0]])
+        self.assertTrue(accepted.exists())
+        self.assertEqual(self.tool.delete_outputs([accepted]), [accepted])
+        self.assertTrue(all(path.exists() for path in rejected))
+
+    def test_video_export_failure_removes_partial_output_and_releases_operation(self):
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        def failing_render(_source, destination, *args, **kwargs):
+            Path(destination).write_bytes(b"partial video")
+            raise OSError("Encoder failed")
+        with patch("apps.video_editor.render_speed_segment", side_effect=failing_render):
+            with self.assertRaisesRegex(OSError, "Encoder failed"):
+                self.tool.edit_video(source, 1, 5)
+        self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
+        self.assertEqual(source.read_bytes(), b"original")
+        self.assertTrue(self.tool.synthesize("Again").exists())
+
+    def test_cancelling_video_export_removes_partial_file_and_can_retry_without_loading_model(self):
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        tool = TurboTool(self.folder, factory=FakeTurbo)
+        def cancel_render(_source, destination, *args, **kwargs):
+            Path(destination).write_bytes(b"partial video")
+            tool.stop()
+            kwargs["check_stop"]()
+        with patch("apps.video_editor.render_speed_segment", side_effect=cancel_render):
+            with self.assertRaises(Cancelled):
+                tool.edit_video(source, 1, 5)
+        self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
+        def successful_render(_source, destination, *args, **kwargs):
+            kwargs["check_stop"]()
+            Path(destination).write_bytes(b"completed")
+            return SimpleNamespace(output_duration=12.0)
+        with patch("apps.video_editor.render_speed_segment", side_effect=successful_render):
+            output, _ = tool.edit_video(source, 1, 5)
+        self.assertTrue(output.exists())
+        self.assertIsNone(tool.tts)
+        self.assertEqual(source.read_bytes(), b"original")
+
+    def test_video_export_cannot_start_during_another_operation(self):
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        with self.tool.operation(), patch("apps.video_editor.render_speed_segment") as render:
+            with self.assertRaises(RuntimeError):
+                self.tool.edit_video(source, 1, 5)
+            render.assert_not_called()
+
+    def test_video_export_rejects_invalid_numbers_before_rendering(self):
+        source = self.folder / "input.mp4"
+        source.write_bytes(b"original")
+        cases = [dict(start=-1, end=5), dict(start=5, end=5),
+                 dict(start=float("nan"), end=5), dict(start=1, end=float("inf")),
+                 dict(speed=0), dict(speed=5), dict(speed=float("nan")),
+                 dict(ramp_seconds=-1), dict(ramp_seconds=3),
+                 dict(ramp_seconds=float("inf")), dict(quality=100), dict(preset="unknown")]
+        with patch("apps.video_editor.render_speed_segment") as render:
+            for case in cases:
+                with self.subTest(case=case):
+                    options = dict(start=1, end=5)
+                    options.update(case)
+                    with self.assertRaises(ValueError):
+                        self.tool.edit_video(source, **options)
+                    render.assert_not_called()
+        self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
 
     def test_delete_history_validates_entire_selection_and_removes_paired_subtitles(self):
         generated = self.tool.synthesize_with_subtitles("One. Two.")

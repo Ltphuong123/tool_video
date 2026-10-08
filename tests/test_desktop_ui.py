@@ -78,7 +78,7 @@ class DesktopUITests(unittest.TestCase):
         self.app._history_selection()
 
     def test_startup_restores_generated_history_and_preserves_speed_controls(self):
-        self.assertEqual(len(self.app.pages), 8)
+        self.assertEqual(len(self.app.pages), 9)
         self.assertEqual(self.app.book.select(), str(self.app.pages["Văn bản"]))
         self.assertEqual(self._paths(), {
             self.speech, self.paired_audio, self.subtitle,
@@ -91,6 +91,82 @@ class DesktopUITests(unittest.TestCase):
         self.assertNotIn("speed_method", self.app.vars)
         self.assertEqual(float(self.app.srt_min_speed.get()), 1.0)
         self.assertEqual(str(self.app.history.cget("selectmode")), "extended")
+        self.assertIn("Video", self.app.pages)
+        self.assertEqual(self.app.video_path.get(), "")
+        self.assertEqual(float(self.app.video_start.get()), 0.0)
+        self.assertEqual(float(self.app.video_end.get()), 10.0)
+        self.assertEqual(float(self.app.video_speed.get()), 1.5)
+        self.assertEqual(float(self.app.video_ramp.get()), 0.5)
+        self.assertTrue(self.app.video_keep_audio.get())
+
+    def test_video_export_forwards_segment_ramp_and_audio_without_loading_tts(self):
+        source = self.folder / "original video.mp4"
+        source.write_bytes(b"input video")
+        self.app.video_path.set(str(source))
+        self.app.video_start.set("12.5")
+        self.app.video_end.set("23.75")
+        self.app.video_speed.set("0.8")
+        self.app.video_ramp.set("1.25")
+        result = self.destination / "video_000000000006.mp4"
+        with patch.object(self.tool, "edit_video", return_value=(result, "Finished")) as render, \
+             patch.object(self.app, "_job", side_effect=lambda function, *args: function()):
+            for keep_audio in (True, False):
+                self.app.video_keep_audio.set(keep_audio)
+                self.app.export_video()
+                self.assertEqual(render.call_args.args, (str(source), 12.5, 23.75))
+                self.assertEqual(render.call_args.kwargs["speed"], 0.8)
+                self.assertEqual(render.call_args.kwargs["ramp_seconds"], 1.25)
+                self.assertEqual(render.call_args.kwargs["keep_audio"], keep_audio)
+                self.assertEqual(render.call_args.kwargs["quality"], 20)
+                self.assertEqual(render.call_args.kwargs["preset"], "fast")
+                self.assertTrue(callable(render.call_args.kwargs["progress"]))
+        self.assertIsNone(self.tool.tts)
+
+    def test_video_export_rejects_non_numeric_fields_before_starting_a_job(self):
+        self.app.video_path.set(str(self.folder / "input.mp4"))
+        for variable in (self.app.video_start, self.app.video_end,
+                         self.app.video_speed, self.app.video_ramp):
+            previous = variable.get()
+            with self.subTest(field=str(variable)), patch.object(self.app, "_job") as job:
+                variable.set("invalid number")
+                try:
+                    with self.assertRaises(ValueError):
+                        self.app.export_video()
+                    job.assert_not_called()
+                finally:
+                    variable.set(previous)
+
+    def test_generated_video_history_can_save_open_and_delete_without_touching_input(self):
+        video = self.destination / "video_000000000006.mp4"
+        video.write_bytes(b"generated MP4")
+        source = self.destination / "input.mp4"
+        source.write_bytes(b"original MP4")
+        other = self.destination / "speech_000000000007.mp4"
+        other.write_bytes(b"not a generated video")
+        self.app.refresh_history()
+        self.assertIn(video, self._paths())
+        self.assertNotIn(source, self._paths())
+        self.assertNotIn(other, self._paths())
+        self.app.history_kind.set("Video")
+        self.assertEqual(self._paths(), {video})
+        self._select(video)
+        with patch.object(self.app, "_open_file") as open_file, patch.object(self.app, "_job") as job:
+            self.app.play_selected()
+        open_file.assert_called_once_with(video)
+        job.assert_not_called()
+        destination = self.folder / "saved copy.mp4"
+        with patch("apps.v3turbo_desktop.filedialog.asksaveasfilename", return_value=str(destination)):
+            self.app.save_selected()
+        self.assertEqual(destination.read_bytes(), video.read_bytes())
+        with patch.object(self.app, "_open_folder") as open_folder:
+            self.app.open_selected_folder()
+        open_folder.assert_called_once_with(self.destination)
+        with patch("apps.v3turbo_desktop.messagebox.askyesno", return_value=True):
+            self.app.delete_selected_files()
+        self.assertFalse(video.exists())
+        self.assertTrue(source.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(destination.exists())
 
     def test_directory_choice_persists_and_restart_loads_history_from_both_folders(self):
         second = self.folder / "second destination"
@@ -205,7 +281,7 @@ class DesktopUITests(unittest.TestCase):
                         self.assertLessEqual(delete.winfo_rooty() + delete.winfo_height(),
                                              self.app.book.winfo_rooty() + self.app.book.winfo_height())
             for title, action in (("Văn bản", "Tạo audio"), ("Hàng loạt", "Tạo batch và ZIP"),
-                                  ("Hội thoại", "Tạo hội thoại")):
+                                  ("Hội thoại", "Tạo hội thoại"), ("Video", "Xuất video")):
                 with self.subTest(size=(width, height), primary_action=action):
                     self.app.nav_buttons[title].invoke()
                     self.root.update()

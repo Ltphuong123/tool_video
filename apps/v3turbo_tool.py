@@ -31,10 +31,10 @@ DEFAULT_MODEL = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
 STREAM_BUFFER_BYTES = 8 * 1024 * 1024
 OUTPUT_NAME = re.compile(
     r"^(speech(?:_subtitled)?|stream|conversation|srt|denoised|microphone|"
-    r"batch(?:_\d{4,})?|voices|reference)_[0-9a-f]{12}\.([a-z0-9]+)$", re.IGNORECASE,
+    r"batch(?:_\d{4,})?|voices|reference|video)_[0-9a-f]{12}\.([a-z0-9]+)$", re.IGNORECASE,
 )
 OUTPUT_KINDS = {"wav": "Audio", "flac": "Audio", "mp3": "Audio", "srt": "Phụ đề",
-                "zip": "Batch ZIP", "json": "Giọng đã xuất", "npz": "Embedding / codes"}
+                "zip": "Batch ZIP", "json": "Giọng đã xuất", "npz": "Embedding / codes", "mp4": "Video"}
 
 
 class Cancelled(RuntimeError):
@@ -210,9 +210,9 @@ class TurboTool:
             return None
         label, suffix = (part.lower() for part in match.groups())
         if suffix in ("wav", "flac", "mp3"):
-            return "Audio" if label not in ("voices", "reference") else None
+            return "Audio" if label not in ("voices", "reference", "video") else None
         expected = {"srt": "speech_subtitled", "zip": "batch",
-                    "json": "voices", "npz": "reference"}
+                    "json": "voices", "npz": "reference", "mp4": "video"}
         return OUTPUT_KINDS.get(suffix) if expected.get(suffix) == label else None
 
     def list_outputs(self) -> list[OutputFile]:
@@ -599,6 +599,39 @@ class TurboTool:
                 track = concatenate(clips, 48000)
                 note = "Các câu nối tiếp, nghỉ 0,5 giây."
             return self._save(track, fmt, label="srt"), note
+
+    def edit_video(self, path, start, end, speed=1.5, ramp_seconds=0.5, keep_audio=True,
+                   quality=20, preset="fast", progress: Callable = lambda message: None):
+        values = (start, end, speed, ramp_seconds)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Mốc thời gian và tốc độ video phải là số hữu hạn.")
+        if start < 0 or end <= start:
+            raise ValueError("Mốc kết thúc phải sau mốc bắt đầu và mốc bắt đầu không âm.")
+        if not 0.25 <= speed <= 4 or not 0 <= ramp_seconds <= (end - start) / 2:
+            raise ValueError("Tốc độ video cần 0.25–4.0x; thời gian chuyển không vượt nửa đoạn đã chọn.")
+        if not isinstance(quality, int) or isinstance(quality, bool) or not 18 <= quality <= 28:
+            raise ValueError("Chất lượng video CRF phải là số nguyên 18–28.")
+        if preset not in ("fast", "medium", "faster"):
+            raise ValueError("Cấu hình xuất video không hợp lệ.")
+        source = Path(path).expanduser().resolve()
+        if not source.is_file():
+            raise ValueError("Không tìm thấy video đầu vào.")
+        with self.operation(require_model=False):
+            from apps.video_editor import render_speed_segment
+            destination = self._path("video", ".mp4")
+            try:
+                result = render_speed_segment(source, destination, start, end, speed=speed,
+                                              ramp_seconds=ramp_seconds, keep_audio=keep_audio,
+                                              quality=quality, preset=preset, check_stop=self.check_stop,
+                                              progress=progress)
+                self.check_stop()
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+            note = f"MoviePy · {start:.2f}–{end:.2f}s · {speed:g}x · chuyển tốc độ {ramp_seconds:g}s."
+            if result is not None:
+                note += f" Video xuất {result.output_duration:.2f}s."
+            return destination, note
 
     def _persist_voices(self):
         self.voices_path.parent.mkdir(parents=True, exist_ok=True)

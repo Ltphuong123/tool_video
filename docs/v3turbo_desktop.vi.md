@@ -7,8 +7,8 @@ Chạy trên Windows bằng Tkinter, không cần trình duyệt, dùng Python 3
 Trong thư mục dự án:
 
 ```powershell
-uv sync --extra srt-quality
-uv run --extra srt-quality python v3turbo_desktop.py
+uv sync --extra srt-quality --extra video
+uv run --extra srt-quality --extra video python v3turbo_desktop.py
 ```
 
 Cũng có thể bấm đúp `run_v3turbo_desktop.bat`. Nếu `.venv` đã có, launcher dùng Python trong môi trường đó. Sau khi cài package có thể chạy `vieneu-desktop`.
@@ -16,23 +16,25 @@ Cũng có thể bấm đúp `run_v3turbo_desktop.bat`. Nếu `.venv` đã có, l
 Để chạy CUDA:
 
 ```powershell
-uv sync --extra cuda --extra srt-quality
-uv run --extra cuda --extra srt-quality python v3turbo_desktop.py
+uv sync --extra cuda --extra srt-quality --extra video
+uv run --extra cuda --extra srt-quality --extra video python v3turbo_desktop.py
 ```
 
 Các dependency tùy chọn:
 
 ```powershell
-uv sync --extra cuda --extra srt-quality --extra pdf --extra watermark --extra finetune
+uv sync --extra cuda --extra srt-quality --extra video --extra pdf --extra watermark --extra finetune
 ```
 
 `pdf` thêm PyMuPDF; `watermark` thêm Resemble Perth; `finetune` thêm thư viện train LoRA. CPU chỉ cần `uv sync`. Trên Linux cần cài Tkinter của hệ điều hành và `sounddevice` để phát audio. Bản ghi micro tích hợp dùng Windows MCI.
 
 `srt-quality` thêm Pedalboard có Rubber Band tích hợp để xử lý tốc độ cho cả SRT và các chức năng đọc khác. Tool dùng duy nhất Rubber Band; khi cần đổi tốc độ hoặc đọc SRT mà thiếu thư viện sẽ báo lỗi trước khi sinh audio. Đọc văn bản ở tốc độ gốc `1.0x` không cần chạy bộ chỉnh tốc độ. Nếu cập nhật môi trường đang dùng CUDA, giữ `--extra cuda` trong lệnh sync.
 
+`video` thêm MoviePy 2 và imageio-ffmpeg để đọc/xuất video. Các chức năng TTS không cần import MoviePy khi khởi động. Launcher dùng `.venv` sẵn có thì cần cài extra này vào môi trường đó trước khi mở trang Video.
+
 ## Giao diện và điều hướng
 
-Thanh bên trái sắp xếp theo quy trình: **Đọc văn bản → Đọc phụ đề SRT → Tạo hàng loạt → Hội thoại → Thư viện giọng → Lịch sử & file → Cấu hình → Fine-tune & API**. Tool mở ở trang Văn bản; thanh trên luôn hiển thị nơi lưu và nút đổi thư mục. Các trang cấu hình dài có thanh cuộn; bố cục cấu hình tự chuyển về một cột khi cửa sổ hẹp. Nút tạo audio được làm nổi bật, trạng thái model và tiến trình tách khỏi khu vực nhập nội dung.
+Thanh bên trái sắp xếp theo quy trình: **Đọc văn bản → Đọc phụ đề SRT → Chỉnh tốc độ video → Tạo hàng loạt → Hội thoại → Thư viện giọng → Lịch sử & file → Cấu hình → Fine-tune & API**. Tool mở ở trang Văn bản; thanh trên luôn hiển thị nơi lưu và nút đổi thư mục. Các trang cấu hình dài có thanh cuộn; bố cục cấu hình tự chuyển về một cột khi cửa sổ hẹp. Nút tạo audio được làm nổi bật, trạng thái model và tiến trình tách khỏi khu vực nhập nội dung.
 
 1. **Cấu hình**: model/repo hoặc thư mục merge, auto/CPU/CUDA, ONNX/PyTorch, fp32/int8, dtype GPU, số luồng CPU, giới hạn streaming, thử lại câu ngắn. Chỉnh tốc độ đọc, temperature, top_k, top_p, phạt lặp/cửa sổ lặp, frame/đoạn, ký tự/đoạn và batch. Bật khử nhiễu, mã tham chiếu, watermark. Xuất WAV/FLAC/MP3; MP3 cần libsndfile có bộ mã hóa phù hợp.
 2. **Văn bản**: nhập văn bản hoặc TXT/Markdown/PDF, chọn giọng, clone trực tiếp bằng audio mẫu, tạo audio, audio + SRT từng câu hoặc streaming và nghe. Audio mẫu được ưu tiên hơn giọng chọn. PDF scan cần OCR trước.
@@ -42,12 +44,25 @@ Thanh bên trái sắp xếp theo quy trình: **Đọc văn bản → Đọc ph�
 6. **SRT**: luôn đọc theo mốc bắt đầu tuyệt đối của phụ đề và giữ các khoảng trống. Tự tăng tốc từng câu khi cần vừa khung thời gian, không đẩy câu sau lùi đi. Có tốc độ ban đầu/tối thiểu riêng.
 7. **Fine-tune / API**: chạy lần lượt prepare/train/merge/đóng gói giọng bằng script sẵn có; hoặc chạy API streaming model gốc với CPU/CUDA, cổng và API key. API chỉ bind `127.0.0.1`. Giọng của desktop và giọng đăng ký trong API là hai thư viện riêng.
 8. **Lịch sử & file**: tự đọc lại file đã tạo khi mở tool, tìm theo tên/đường dẫn, lọc loại file, xem thời gian và dung lượng. Nghe audio, lưu bản sao, mở thư mục chứa file hoặc xóa nhiều file. Nhật ký hoạt động nằm ở thẻ riêng trong cùng trang.
+9. **Video**: dùng MoviePy để đổi tốc độ một đoạn trong video dài, chuyển tốc độ từ từ ở hai đầu; giữ tiếng gốc đồng bộ và hạn chế đổi cao độ bằng Rubber Band. Không cần tải model TTS.
+
+## Đổi tốc độ một đoạn video bằng MoviePy
+
+Trong trang **Chỉnh tốc độ video**, chọn video rồi bấm **Đọc thông tin video** để xem kích thước, FPS và thời lượng. Nhập mốc bắt đầu/kết thúc theo **giây trong video gốc**, tốc độ từ `0.25x` đến `4.0x`, và thời gian chuyển tốc độ mỗi đầu. Bấm **Xuất video** để tạo một MP4 mới; video gốc được giữ lại.
+
+Ví dụ chọn đoạn `30–45s`, tốc độ `1.5x`, chuyển mỗi đầu `0.5s`: tốc độ tăng dần từ `1.0x` lên `1.5x` trong nửa giây đầu của đoạn nguồn, giữ `1.5x` ở giữa, rồi giảm về `1.0x` trong nửa giây cuối. Các phần trước/sau vẫn chạy `1.0x`. Chuyển `0s` để đổi tốc độ ngay; thời gian chuyển không được lớn hơn nửa độ dài đoạn. Biểu đồ thể hiện đường tốc độ đã chọn. Đổi tốc độ sẽ thay đổi tổng thời lượng và vị trí của phần sau đoạn chỉnh.
+
+**Giữ tiếng gốc và đổi tốc độ đồng bộ** bật mặc định. Video và audio dùng chung một đường thời gian; audio mono/stereo được xử lý bằng Rubber Band, với các cửa sổ nhỏ chồng lấn ở chỗ chuyển tốc độ. Cách này tránh trôi thời gian tích lũy và hạn chế đổi cao độ; cần nghe kiểm tra chất âm với nội dung thật, nhất là khi đổi tốc độ mạnh. Bỏ dấu chọn để xuất video không tiếng. Khi chọn `1.0x`, phần audio bỏ qua Rubber Band.
+
+Tool xuất MP4 H.264/AAC, giữ FPS danh nghĩa của nguồn. CRF thấp hơn cho chất lượng cao hơn/file lớn hơn; mặc định `20`. Preset `faster/fast/medium` điều chỉnh thời gian mã hóa; mặc định `fast`. Kích thước lẻ được đệm thêm tối đa một pixel để phù hợp H.264/yuv420p. MoviePy đổi timeline hình ảnh; chức năng này chưa nội suy chuyển động, nên độ mượt khi làm chậm phụ thuộc FPS gốc. Track phụ đề trong video hoặc file SRT đi kèm chưa được tự chuyển mốc.
+
+File `video_<mã>.mp4` lưu trong thư mục đang chọn, xuất hiện trong **Lịch sử & file → Video**. **Mở / nghe** mở video bằng trình phát mặc định; có thể lưu bản sao hoặc xóa như các file khác. Nút **Dừng tác vụ / phát** hủy lượt xuất và dọn file dở. Giới hạn bộ nhớ theo các cửa sổ audio và khung hình, không nạp toàn bộ video vào RAM.
 
 ## Nơi lưu và lịch sử file
 
 Bấm **Đổi thư mục…** trên thanh **Nơi lưu**, hoặc vào **Cấu hình → Lưu trữ kết quả**, chọn/nhập thư mục rồi bấm **Áp dụng nơi lưu**. Tool kiểm tra quyền ghi và nhớ lựa chọn cho lần mở sau. Có thể đổi nơi lưu khi model đã tải; file tạo tiếp theo sử dụng thư mục mới. Đổi nơi lưu không di chuyển các file đã có, thư viện giọng clone vẫn ở vị trí ban đầu.
 
-Trang **Lịch sử & file** hiển thị các kết quả trong thư mục hiện tại và các thư mục từng sử dụng, mới nhất ở trên. Bao gồm WAV/FLAC/MP3, SRT từng câu, ZIP batch, thư viện giọng JSON đã xuất, NPZ tham chiếu và bản ghi micro. Tool đọc thông tin file để khôi phục lịch sử khi khởi động; file đã bị xóa hoặc thư mục không còn truy cập được sẽ không hiện. Nút **Làm mới** cập nhật thay đổi bên ngoài. File đầu vào và `user_voices.json` không nằm trong danh sách xóa.
+Trang **Lịch sử & file** hiển thị các kết quả trong thư mục hiện tại và các thư mục từng sử dụng, mới nhất ở trên. Bao gồm WAV/FLAC/MP3, MP4 đã xuất, SRT từng câu, ZIP batch, thư viện giọng JSON đã xuất, NPZ tham chiếu và bản ghi micro. Tool đọc thông tin file để khôi phục lịch sử khi khởi động; file đã bị xóa hoặc thư mục không còn truy cập được sẽ không hiện. Nút **Làm mới** cập nhật thay đổi bên ngoài. File đầu vào và `user_voices.json` không nằm trong danh sách xóa.
 
 Nhập từ khóa vào **Tìm file**, chọn loại để lọc. Chọn một file để xem đường dẫn, nghe audio, lưu bản sao hoặc mở thư mục chứa file. Dùng **Ctrl / Shift** để chọn nhiều file, hoặc bấm **Chọn tất cả** để chọn các file đang hiển thị. **Xóa file đã chọn** hiển thị danh sách xác nhận rồi xóa vĩnh viễn khỏi máy. Mặc định **Xóa kèm SRT cùng tên** xóa phụ đề đi kèm khi chọn audio; bỏ dấu chọn nếu muốn giữ SRT. Đang tạo audio, phát audio hoặc ghi micro thì cần dừng/chờ hoàn tất trước khi xóa hay đổi nơi lưu.
 
@@ -122,6 +137,7 @@ $env:PYTHONPATH = 'src'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_speech_subtitles.py -v
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_srt_timing.py -v
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_desktop_ui.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_video_editor.py -v
 .\.venv\Scripts\python.exe v3turbo_desktop.py --check
 ```
 

@@ -118,7 +118,7 @@ demo:
 run: demo
 
 desktop:
-	uv run --extra srt-quality python v3turbo_desktop.py
+	uv run --extra srt-quality --extra video python v3turbo_desktop.py
 
 stream:
 	uv run vieneu-stream

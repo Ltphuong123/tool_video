@@ -97,6 +97,10 @@ srt-quality = [
     "pedalboard>=0.9.26,<0.10", # Rubber Band for all desktop tempo processing
 ]
 
+video = [
+    "moviepy>=2.2,<3", # Desktop segment speed ramps and MP4 export
+]
+
 legacy = [
     "torch",
     "torchaudio",
