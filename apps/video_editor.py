@@ -216,7 +216,7 @@ def probe_video(path) -> dict:
 
 def render_speed_segment(source, destination, start: float, end: float,
                          speed: float = 1.5, ramp_seconds: float = 0.5,
-                         keep_audio: bool = True, quality: int = 20,
+                         keep_audio: bool = False, quality: int = 20,
                          preset: str = "fast", check_stop: Callable = lambda: None,
                          progress: Callable = lambda fraction: None) -> SpeedTimeMap:
     """Create a new MP4, keeping all frames outside the selected source range.
@@ -232,7 +232,7 @@ def render_speed_segment(source, destination, start: float, end: float,
 
 
 def render_speed_segments(source, destination, segments: Iterable[SpeedSegment],
-                          keep_audio: bool = True, quality: int = 20,
+                          keep_audio: bool = False, quality: int = 20,
                           preset: str = "fast", check_stop: Callable = lambda: None,
                           progress: Callable = lambda fraction: None) -> MultiSpeedTimeMap:
     """Render multiple source ranges using one shared video/audio timeline."""
@@ -246,7 +246,7 @@ def render_speed_segments(source, destination, segments: Iterable[SpeedSegment],
 
 def render_marker_alignment(source, destination, old_markers: Iterable[TimeMarker],
                             new_markers: Iterable[TimeMarker],
-                            keep_audio: bool = True, quality: int = 20,
+                            keep_audio: bool = False, quality: int = 20,
                             preset: str = "fast", check_stop: Callable = lambda: None,
                             progress: Callable = lambda fraction: None) -> MarkerTimeMap:
     """Render the exact marker alignment with the shared video/audio pipeline."""
@@ -285,6 +285,8 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
     partial = destination.parent / f".video_{token}.mp4"
     mux_audio = destination.parent / f".video_{token}.m4a"
     source_clip = output_clip = None
+    video_start = 0.25 if keep_audio else 0.0
+    video_span = 0.99 - video_start
 
     class RenderLogger(ProgressBarLogger):
         def callback(self, **changes):
@@ -295,7 +297,7 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
             if attr == "index":
                 total = self.bars[bar].get("total", 0)
                 if total:
-                    progress(0.25 + 0.74 * min(1, max(0, value / total)))
+                    progress(video_start + video_span * min(1, max(0, value / total)))
 
     try:
         progress(0)
@@ -323,14 +325,14 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
                 encode_mapped_audio(source_clip.audio, mux_audio, mapping,
                                     check_stop=check_stop,
                                     progress=lambda fraction: progress(0.25 * fraction))
-        progress(0.25)
+        progress(video_start)
         if can_render_ffmpeg(mapping):
-            # Marker alignment and immediate speed changes can stay entirely
-            # inside FFmpeg, avoiding Python RGB copies and repeated seeking.
+            # All shared timelines, including smooth ramps, stay inside
+            # FFmpeg, avoiding Python RGB copies and repeated seeking.
             render_video_ffmpeg(
                 source, partial, mapping, fps, audio_path=mux_audio if has_audio else None,
                 quality=quality, preset=preset, check_stop=check_stop,
-                progress=lambda fraction: progress(0.25 + 0.74 * fraction),
+                progress=lambda fraction: progress(video_start + video_span * fraction),
                 size=source_clip.size,
             )
         else:

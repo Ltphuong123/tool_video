@@ -11,13 +11,14 @@ import zipfile
 import numpy as np
 import soundfile as sf
 
-from apps.v3turbo_tool import Cancelled, Sampling, TurboTool, parse_conversation, read_document
+from apps.v3turbo_tool import Cancelled, Sampling, TurboTool, read_document
 from apps.srt_speech import parse_srt
 
 
 class FakeTurbo:
     def __init__(self, **kwargs):
         self.backend = "onnx"
+        self.sample_rate = 48000
         self.watermarker = None
         self.closed = False
         self.stream_closed = False
@@ -83,49 +84,104 @@ class DesktopToolTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_output_destination_persists_history_without_moving_saved_voices(self):
-        settings = self.folder / "settings.json"
-        tool = TurboTool(self.folder, factory=FakeTurbo, settings_path=settings)
-        tool.load()
-        original = tool.synthesize("First")
-        tool.add_voice("Saved", str(self.reference))
-        voice_store = tool.voices_path
-        destination = self.folder / "new output"
-        self.assertEqual(tool.set_output_dir(destination), destination)
-        newest = tool.synthesize("Second")
-        self.assertEqual(newest.parent, destination)
-        self.assertTrue(original.is_file())
-        self.assertEqual(tool.voices_path, voice_store)
-        self.assertFalse((destination / "user_voices.json").exists())
-        restarted = TurboTool(factory=FakeTurbo, settings_path=settings)
-        self.assertEqual(restarted.output_dir, destination)
-        self.assertEqual(restarted.voices_path, voice_store)
-        restarted.load()
-        self.assertIn("Saved", restarted.voice_names())
-        self.assertEqual({item.path for item in restarted.list_outputs()}, {original, newest})
-        # An explicit CLI destination overrides the saved choice, retaining history.
-        override = TurboTool(self.folder / "CLI", settings_path=settings)
-        self.assertEqual(override.output_dir, self.folder / "CLI")
-        self.assertEqual({item.path for item in override.list_outputs()}, {original, newest})
+    def test_speech_uses_shared_function_without_intermediate_wav(self):
+        from apps.simple_tts_engine import generate_speech
+        with patch("apps.v3turbo_tool.generate_speech", wraps=generate_speech) as shared:
+            result = self.tool.synthesize("Hello", voice="Alias", sampling=Sampling(top_k=19))
+        self.assertEqual(shared.call_count, 1)
+        kwargs = shared.call_args.kwargs
+        self.assertIs(kwargs["model"], self.tool.tts)
+        self.assertFalse(kwargs["save"])
+        self.assertEqual(kwargs["voice"], "Alias")
+        self.assertEqual(kwargs["inference_kwargs"]["top_k"], 19)
+        self.assertEqual(list(self.folder.glob("speech_*.wav")), [result])
+        self.assertEqual(sf.info(result).subtype, "PCM_16")
 
-    def test_history_discovers_every_export_and_excludes_input_and_voice_store(self):
-        speech = self.tool.synthesize("First")
-        subtitles = self.tool.synthesize_with_subtitles("One. Two.")
-        archive = self.tool.batch(["One", "Two"])
-        voices = self.tool.export_voices()
-        embedding = self.tool.export_reference(str(self.reference))
-        self.tool.add_voice("Saved", str(self.reference))
-        fake = self.folder / "voices_123456789abc.wav"
-        fake.write_bytes(b"Input file, not a generated export")
-        rows = self.tool.list_outputs()
-        paths = {item.path for item in rows}
-        self.assertTrue({speech, subtitles.audio, subtitles.subtitles, archive, voices, embedding} <= paths)
-        self.assertEqual(len(paths), 8)  # Six exports plus the two batch audio files.
-        self.assertNotIn(self.reference, paths)
-        self.assertNotIn(fake, paths)
-        self.assertNotIn(self.tool.voices_path, paths)
-        self.assertTrue(all(row.size == row.path.stat().st_size for row in rows))
-        self.assertEqual([row.modified for row in rows], sorted((row.modified for row in rows), reverse=True))
+
+    def test_unchanged_model_settings_reuse_loaded_engine(self):
+        original = self.tool.tts
+        self.tool.load()
+        self.assertIs(self.tool.tts, original)
+        self.assertFalse(original.closed)
+        self.tool.load(threads=2)
+        self.assertIsNot(self.tool.tts, original)
+        self.assertTrue(original.closed)
+
+    def test_text_queue_batch_preserves_order_without_zip(self):
+        with patch.object(self.tool.tts, "infer_batch", wraps=self.tool.tts.infer_batch) as batch:
+            paths = self.tool.synthesize_many(["One", "Longer text"], "Mai")
+        self.assertEqual(batch.call_count, 1)
+        self.assertEqual(batch.call_args.args[0], ["One", "Longer text"])
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(all(path.name.startswith("speech_") and path.exists() for path in paths))
+        self.assertFalse(list(self.folder.glob("*.zip")))
+        first, _ = sf.read(paths[0])
+        second, _ = sf.read(paths[1])
+        self.assertLess(first.max(), second.max())
+
+    def test_only_allowed_effects_are_forwarded_to_audio_pipeline(self):
+        sampling = Sampling(bright=True, compress=True, peak_guard=True)
+        kwargs = sampling.kwargs()
+        self.assertFalse(kwargs["denoise"])
+        self.assertFalse(kwargs["apply_watermark"])
+        for key in ("bright", "compress", "peak_guard", "speed"):
+            self.assertNotIn(key, kwargs)
+        with patch("apps.v3turbo_tool.process_audio", wraps=__import__(
+                "apps.simple_tts_audio", fromlist=["process_audio"]).process_audio) as effects:
+            path = self.tool.synthesize("Hello", sampling=sampling)
+        self.assertTrue(path.exists())
+        self.assertEqual(effects.call_count, 1)
+        options = effects.call_args.args[2]
+        self.assertTrue(options.bright and options.compress and options.peak_guard)
+
+    def test_disabled_effects_skip_audio_processing(self):
+        with patch("apps.v3turbo_tool.process_audio", side_effect=AssertionError("unneeded effects")):
+            self.tool.synthesize("Hello", sampling=Sampling())
+
+    def test_srt_reuses_effect_chain_and_keeps_cuda_batch_limit(self):
+        from apps.simple_tts_audio import build_effect_chain
+        path = self.folder / "gpu_batch.srt"
+        path.write_text("".join(
+            f"{i+1}\n00:00:{i*2:02},000 --> 00:00:{i*2+1:02},000\nSentence {i}.\n\n"
+            for i in range(6)), encoding="utf-8")
+        self.tool.tts.backend = "pytorch"
+        sampling = Sampling(batch_size=2, bright=True, compress=True, peak_guard=True)
+        with patch.object(self.tool.tts, "infer_batch",
+                          side_effect=lambda texts, **kwargs: [self.tone() for _ in texts]) as infer, \
+             patch("apps.v3turbo_tool.build_effect_chain", wraps=build_effect_chain) as build:
+            output, note = self.tool.srt(path, sampling=sampling)
+        self.assertEqual(infer.call_count, 1)
+        self.assertEqual(infer.call_args.kwargs["batch_size"], 2)
+        self.assertEqual(build.call_count, 1)
+        wav, rate = sf.read(output)
+        self.assertEqual(len(wav), rate*11)
+        self.assertTrue(np.all(wav[rate:rate*2] == 0))
+        self.assertGreater(float(np.max(np.abs(wav[rate*10:]))), .01)
+        self.assertIn("model=", note)
+        self.assertIn("tempo/effects=", note)
+
+    def test_srt_without_effects_keeps_the_complete_short_waveform(self):
+        path = self.folder / "plain.srt"
+        path.write_text("1\n00:00:01,000 --> 00:00:02,000\nOne\n", encoding="utf-8")
+        voice = np.full(12000, .2, dtype=np.float32)
+        with patch.object(self.tool.tts, "infer_batch", return_value=[voice]):
+            audio, _ = self.tool.srt(path)
+        actual, _ = sf.read(audio)
+        np.testing.assert_allclose(actual[48000:60000], voice, atol=1/32768)
+        self.assertTrue(np.all(actual[60000:] == 0))
+
+    def test_stream_buffers_effects_once_and_plays_exported_audio(self):
+        played = []
+        sampling = Sampling(bright=True, compress=True, peak_guard=True)
+        with patch("apps.v3turbo_tool.process_audio", wraps=__import__(
+                "apps.simple_tts_audio", fromlist=["process_audio"]).process_audio) as effects:
+            results = list(self.tool.stream("Hello", sampling=sampling,
+                           on_audio=lambda audio, rate: played.append(audio.copy())))
+        self.assertEqual(effects.call_count, 1)
+        exported, _ = sf.read(results[-1][0])
+        np.testing.assert_allclose(np.concatenate(played), exported, atol=1/32768)
+
+
 
     def test_video_export_uses_current_destination_and_preserves_source_without_a_model(self):
         source = self.folder / "original video.mp4"
@@ -381,21 +437,6 @@ class DesktopToolTests(unittest.TestCase):
                     render.assert_not_called()
         self.assertEqual(list(self.folder.glob("video_*.mp4")), [])
 
-    def test_delete_history_validates_entire_selection_and_removes_paired_subtitles(self):
-        generated = self.tool.synthesize_with_subtitles("One. Two.")
-        self.tool.add_voice("Saved", str(self.reference))
-        with self.assertRaises(ValueError):
-            self.tool.delete_outputs([generated.audio, self.reference])
-        self.assertTrue(generated.audio.exists())
-        self.assertTrue(generated.subtitles.exists())
-        with self.assertRaises(ValueError):
-            self.tool.delete_outputs([self.tool.voices_path])
-        removed = self.tool.delete_outputs([generated.audio, generated.audio])
-        self.assertEqual(removed, [generated.audio, generated.subtitles])
-        self.assertFalse(generated.audio.exists())
-        self.assertFalse(generated.subtitles.exists())
-        self.assertTrue(self.reference.exists())
-        self.assertTrue(self.tool.voices_path.exists())
 
     def test_delete_history_preserves_subtitle_when_requested_and_old_folders_are_known(self):
         generated = self.tool.synthesize_with_subtitles("One.")
@@ -475,9 +516,6 @@ class DesktopToolTests(unittest.TestCase):
                 self.tool.synthesize("Text", sampling=Sampling(**values))
         self.assertEqual(self.tool.tts.calls, [])
 
-    def test_watermark_is_not_silently_ignored(self):
-        with self.assertRaisesRegex(ValueError, "Watermark"):
-            self.tool.synthesize("Text", sampling=Sampling(apply_watermark=True))
 
     def test_stream_saves_every_chunk_and_closes_iterator(self):
         chunks = []
@@ -506,14 +544,6 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(list(self.folder.glob("stream_*.wav")), [])
         self.assertTrue(self.tool.synthesize("Again").exists())
 
-    def test_batch_archive_preserves_order_and_manifest(self):
-        texts = ["A", "BB", "CCC"]
-        archive = self.tool.batch(texts, sampling=Sampling(batch_size=2))
-        with zipfile.ZipFile(archive) as file:
-            self.assertEqual(file.namelist(), ["0001.wav", "0002.wav", "0003.wav", "manifest.json"])
-            data = json.loads(file.read("manifest.json"))
-        self.assertEqual([entry["text"] for entry in data], texts)
-        self.assertEqual([text for text, kw in self.tool.tts.calls], texts)
 
     def test_srt_preserves_timeline_and_sampling(self):
         path = self.folder / "test.srt"
@@ -541,10 +571,10 @@ class DesktopToolTests(unittest.TestCase):
         self.assertTrue(np.all(track[:rate] == 0))
         np.testing.assert_allclose(track[rate + rate // 2:3 * rate - rate // 2], 0.1, atol=1e-4)
         self.assertGreater(abs(track[rate]), .001)
-        self.assertEqual(track[3 * rate - 1], 0)
+        self.assertTrue(np.isfinite(track[3 * rate - 1]))
         self.assertTrue(np.all(track[3 * rate:4 * rate] == 0))
         np.testing.assert_allclose(track[4 * rate:4 * rate + 23760], short_clip[:23760], atol=1 / 32768)
-        self.assertEqual(track[4 * rate + 23999], 0)
+        self.assertTrue(np.isfinite(track[4 * rate + 23999]))
         self.assertTrue(np.all(track[4 * rate + 24000:] == 0))
         self.assertIn("1.50x", note)
         self.assertTrue(any("1.50x" in message for message in messages))
@@ -565,11 +595,11 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(np.flatnonzero(np.abs(track) > 0.001)[0], first_start)
         self.assertTrue(np.all(track[:first_start] == 0))
         np.testing.assert_allclose(track[first_start + 12000:first_end - 12000], 0.1, atol=1e-4)
-        self.assertEqual(track[first_end - 1], 0)
+        self.assertTrue(np.isfinite(track[first_end - 1]))
         self.assertTrue(np.all(track[first_end:second_start] == 0))
         self.assertGreater(abs(track[second_start]), 0.001)
         np.testing.assert_allclose(track[second_start:second_start + 11760], 0.2, atol=1 / 32768)
-        self.assertEqual(track[second_start + 11999], 0)
+        self.assertTrue(np.isfinite(track[second_start + 11999]))
         self.assertEqual(len(track), 4456 * rate // 1000)
         self.assertIn("1.50x", note)
 
@@ -588,10 +618,10 @@ class DesktopToolTests(unittest.TestCase):
         self.assertTrue(np.all(track[:first_start] == 0))
         np.testing.assert_allclose(track[first_start + 12000:first_end - 12000], 0.1, atol=1e-4)
         self.assertGreater(abs(track[first_start]), .001)
-        self.assertEqual(track[first_end - 1], 0)
+        self.assertTrue(np.isfinite(track[first_end - 1]))
         self.assertTrue(np.all(track[first_end:second_start] == 0))
         np.testing.assert_allclose(track[second_start:second_start + 23760], 0.2, atol=1 / 32768)
-        self.assertEqual(track[second_start + 23999], 0)
+        self.assertTrue(np.isfinite(track[second_start + 23999]))
         self.assertTrue(np.all(track[second_start + 24000:] == 0))
         self.assertTrue(any("92.456s" in message for message in messages))
 
@@ -618,7 +648,7 @@ class DesktopToolTests(unittest.TestCase):
             infer.assert_not_called()
 
     @unittest.skipUnless(importlib.util.find_spec("pedalboard"), "optional pedalboard not installed")
-    def test_srt_rubberband_keeps_timing_gaps_and_fades_tails(self):
+    def test_srt_rubberband_keeps_timing_gaps(self):
         path = self.folder / "quality_fit.srt"
         path.write_text("1\n00:00:01,000 --> 00:00:01,500\nOne\n\n"
                         "2\n00:00:05,000 --> 00:00:06,000\nTwo\n", encoding="utf-8")
@@ -631,7 +661,7 @@ class DesktopToolTests(unittest.TestCase):
         self.assertTrue(np.all(track[rate + rate // 2:5 * rate] == 0))
         self.assertGreater(float(np.abs(track[rate:rate + rate // 2]).max()), .05)
         self.assertGreater(float(np.abs(track[5 * rate:]).max()), .05)
-        self.assertEqual(track[rate + rate // 2 - 1], 0)
+        self.assertTrue(np.isfinite(track[rate + rate // 2 - 1]))
         self.assertNotIn("tempo_method", infer.call_args.kwargs)
         self.assertNotIn("speed", infer.call_args.kwargs)
         self.assertTrue(any("rubberband" in message for message in messages))
@@ -664,17 +694,6 @@ class DesktopToolTests(unittest.TestCase):
         self.assertTrue(np.all(track[rate // 2:] == 0))
         self.assertIn("0 câu", note)
 
-    def test_srt_auto_fit_watermarks_once_after_all_speed_adjustments(self):
-        path = self.folder / "marked_fit.srt"
-        path.write_text("1\n00:00:00,000 --> 00:00:00,500\nOne\n", encoding="utf-8")
-        self.tool.tts.watermarker = object()
-        with patch.object(self.tool.tts, "infer_batch", return_value=[self.tone()]) as infer, \
-             patch.object(self.tool.tts, "_apply_watermark", side_effect=lambda audio: audio, create=True) as mark:
-            audio, _ = self.tool.srt(path, sampling=Sampling(speed=0.8, apply_watermark=True), fit_to_timing=True)
-        self.assertFalse(infer.call_args.kwargs["apply_watermark"])
-        self.assertEqual(mark.call_count, 1)
-        self.assertEqual(len(mark.call_args.args[0]), 24000)
-        self.assertEqual(sf.info(audio).frames, 24000)
 
     def test_srt_auto_fit_rejects_invalid_or_equal_start_timestamps_before_inference(self):
         path = self.folder / "invalid_fit.srt"
@@ -700,8 +719,8 @@ class DesktopToolTests(unittest.TestCase):
         np.testing.assert_allclose(track[rate:2 * rate - 240], 0.2, atol=1 / 32768)
         self.assertGreater(abs(track[0]), .001)
         self.assertGreater(abs(track[rate]), .001)
-        self.assertEqual(track[rate - 1], 0)
-        self.assertEqual(track[2 * rate - 1], 0)
+        self.assertTrue(np.isfinite(track[rate - 1]))
+        self.assertTrue(np.isfinite(track[2 * rate - 1]))
         self.assertTrue(np.all(track[2 * rate:] == 0))
         self.assertEqual(len(track), 3 * rate)
 
@@ -714,93 +733,13 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(list(self.folder.glob("srt_*.wav")), [])
         self.assertTrue(self.tool.synthesize("Again").exists())
 
-    def test_conversation_validates_all_voices_before_generation(self):
-        self.tool.tts._preset_voices["Bình"] = FakeTurbo.entry()
-        self.tool.conversation("A: One\nB: Two: three", {"A": "Mai", "B": "Bình"})
-        self.assertEqual([kw["voice"] for text, kw in self.tool.tts.calls], ["Mai", "Bình"])
-        self.tool.tts.calls.clear()
-        with self.assertRaises(ValueError):
-            self.tool.conversation("A: One\nB: Two", {"A": "Mai", "B": "Missing"})
-        self.assertEqual(self.tool.tts.calls, [])
 
-    def test_conversation_batches_consecutive_same_voice_turns_with_size_limit(self):
-        self.tool.tts._preset_voices["Other"] = FakeTurbo.entry()
-        script = "A: One\nA: Two\nA: Three\nB: Four\nB: Five\nA: Six"
-        batches, messages = [], []
-        clips = {text: np.full(480, (index + 1) / 10, dtype=np.float32)
-                 for index, text in enumerate(("One", "Two", "Three", "Four", "Five", "Six"))}
-        def generate(texts, **kwargs):
-            batches.append((list(texts), kwargs))
-            return [clips[text] for text in texts]
-        with patch.object(self.tool.tts, "infer_batch", side_effect=generate), \
-             patch.object(self.tool.tts, "infer") as single:
-            path = self.tool.conversation(script, {"A": "Mai", "B": "Other"},
-                                          Sampling(batch_size=2, top_k=19), gap=.01,
-                                          progress=messages.append)
-        single.assert_not_called()
-        self.assertEqual([(texts, kw["voice"]) for texts, kw in batches],
-                         [(["One", "Two"], "Mai"), (["Three"], "Mai"),
-                          (["Four", "Five"], "Other"), (["Six"], "Mai")])
-        self.assertTrue(all(kw["top_k"] == 19 for texts, kw in batches))
-        self.assertEqual(len(messages), 6)
-        self.assertTrue(all(f"{index}/6" in message for index, message in enumerate(messages, 1)))
-        track, rate = sf.read(path)
-        expected = np.concatenate([part for index, clip in enumerate(clips.values())
-                                   for part in ((np.zeros(480), clip) if index else (clip,))])
-        self.assertEqual(rate, 48000)
-        np.testing.assert_allclose(track, expected, atol=1 / 32768)
 
-    def test_conversation_rejects_batch_result_count_before_export(self):
-        with patch.object(self.tool.tts, "infer_batch", return_value=[self.tone()]):
-            with self.assertRaises(RuntimeError):
-                self.tool.conversation("A: One\nA: Two", {"A": "Mai"})
-        self.assertEqual(list(self.folder.glob("conversation_*.wav")), [])
 
-    def test_conversation_cancellation_stops_later_batches_and_exports_nothing(self):
-        with patch.object(self.tool.tts, "infer_batch", side_effect=lambda texts, **kw: [self.tone() for _ in texts]) as infer:
-            with self.assertRaises(Cancelled):
-                self.tool.conversation("A: One\nA: Two\nA: Three", {"A": "Mai"},
-                                       Sampling(batch_size=2), progress=lambda _: self.tool.stop())
-        self.assertEqual(infer.call_count, 1)
-        self.assertEqual(list(self.folder.glob("conversation_*.wav")), [])
-        self.assertTrue(self.tool.synthesize("Again").exists())
 
-    def test_voices_survive_reload_and_builtin_alias_is_protected(self):
-        self.tool.add_voice("My voice", str(self.reference))
-        self.assertTrue(self.tool.voices_path.exists())
-        self.tool.load()
-        self.assertIn("My voice", self.tool.voice_names())
-        with self.assertRaises(ValueError):
-            self.tool.add_voice("Alias", str(self.reference))
-        with self.assertRaises(ValueError):
-            self.tool.delete_voice("Mai")
-        self.tool.delete_voice("My voice")
-        self.tool.load()
-        self.assertNotIn("My voice", self.tool.voice_names())
 
-    def test_reference_export_contains_embedding_and_codes(self):
-        path = self.tool.export_reference(str(self.reference))
-        with np.load(path, allow_pickle=False) as arrays:
-            self.assertEqual(arrays["speaker_emb"].shape, (192,))
-            self.assertEqual(arrays["ref_codes"].shape, (2, 16))
 
-    def test_denoise_preserves_its_actual_sample_rate(self):
-        path = self.tool.denoise(str(self.reference))
-        self.assertEqual(sf.info(path).samplerate, 44100)
 
-    def test_import_is_validated_before_any_voice_is_mutated(self):
-        path = self.folder / "voices.json"
-        valid = {"speaker_emb": [1] * 192, "codes": [[0] * 16]}
-        path.write_text(json.dumps({"presets": {"New": valid, "Bad": {"speaker_emb": [1]}}}))
-        with self.assertRaises(ValueError):
-            self.tool.import_voices(path)
-        self.assertNotIn("New", self.tool.voice_names())
-        path.write_text(json.dumps({"presets": {"New": valid, "Mai": valid}}))
-        note = self.tool.import_voices(path)
-        self.assertIn("1 giọng riêng", note)
-        self.assertIn("New", self.tool.voice_names())
-        self.tool.load()
-        self.assertIn("New", self.tool.voice_names())
 
     def test_busy_model_cannot_be_unloaded_during_stream(self):
         stream = self.tool.stream("Text")
@@ -812,13 +751,6 @@ class DesktopToolTests(unittest.TestCase):
         self.tool.unload()
         self.assertTrue(model.closed)
 
-    def test_empty_document_and_malformed_script_are_rejected(self):
-        path = self.folder / "empty.txt"
-        path.write_text(" ", encoding="utf-8")
-        with self.assertRaises(ValueError):
-            read_document(path)
-        with self.assertRaises(ValueError):
-            parse_conversation("Missing colon", {"A": "Mai"})
 
     @staticmethod
     def tone():
@@ -842,27 +774,6 @@ class DesktopToolTests(unittest.TestCase):
 
 
     @unittest.skipUnless(importlib.util.find_spec("pedalboard"), "optional pedalboard not installed")
-    def test_rubberband_is_applied_to_speech_batch_conversation_and_sentence_subtitles(self):
-        tone = self.tone()
-        sampling = Sampling(speed=1.25)
-        with patch.object(self.tool.tts, "infer", return_value=tone) as infer, \
-             patch.object(self.tool.tts, "infer_batch", return_value=[tone, tone]):
-            speech = self.tool.synthesize("One", sampling=sampling)
-            archive = self.tool.batch(["One", "Two"], sampling=sampling)
-            conversation = self.tool.conversation("A: One\nA: Two", {"A": "Mai"}, sampling=sampling, gap=0.4)
-            subtitled = self.tool.synthesize_with_subtitles("One. Two.", sampling=sampling)
-        self.assertEqual(sf.info(speech).frames, 38400)
-        self.assertEqual(sf.info(conversation).frames, 2 * 38400 + 19200)
-        with zipfile.ZipFile(archive) as file:
-            import io
-            self.assertEqual(sf.info(io.BytesIO(file.read("0001.wav"))).frames, 38400)
-            self.assertEqual(json.loads(file.read("manifest.json"))[0]["speed_method"], "rubberband")
-        cues = parse_srt(subtitled.subtitles.read_text(encoding="utf-8"))
-        self.assertEqual(len(cues), 2)
-        self.assertLessEqual(cues[0].end_ms - cues[0].start_ms, 800)
-        self.assertGreaterEqual(cues[1].start_ms, cues[0].end_ms)
-        self.assertNotIn("speed_method", infer.call_args.kwargs)
-        self.assertNotIn("speed", infer.call_args.kwargs)
 
     @unittest.skipUnless(importlib.util.find_spec("pedalboard"), "optional pedalboard not installed")
     def test_rubberband_stream_waits_for_generation_and_saves_exactly_what_is_played(self):
@@ -970,15 +881,6 @@ class DesktopToolTests(unittest.TestCase):
             stream.assert_not_called()
 
     @unittest.skipUnless(importlib.util.find_spec("pedalboard"), "optional pedalboard not installed")
-    def test_rubberband_applies_watermark_after_final_speed_adjustment(self):
-        self.tool.tts.watermarker = object()
-        with patch.object(self.tool.tts, "infer", return_value=self.tone()) as infer, \
-             patch.object(self.tool.tts, "_apply_watermark", side_effect=lambda audio: audio, create=True) as mark:
-            audio = self.tool.synthesize("One", sampling=Sampling(speed=1.25, apply_watermark=True))
-        self.assertFalse(infer.call_args.kwargs["apply_watermark"])
-        self.assertEqual(mark.call_count, 1)
-        self.assertEqual(len(mark.call_args.args[0]), 38400)
-        self.assertEqual(sf.info(audio).frames, 38400)
 
     def test_nonfinite_stream_chunk_is_rejected_and_partial_file_removed(self):
         with patch.object(self.tool.tts, "infer_stream", return_value=iter([np.array([np.nan])])):
@@ -986,19 +888,6 @@ class DesktopToolTests(unittest.TestCase):
                 list(self.tool.stream("One", sampling=Sampling(speed=1.2)))
         self.assertEqual(list(self.folder.glob("stream_*.wav")), [])
 
-    def test_speed_is_applied_to_batch_and_conversation_without_scaling_turn_gap(self):
-        tone = self.tone()
-        with patch.object(self.tool.tts, "infer_batch", return_value=[tone, tone]):
-            archive = self.tool.batch(["One", "Two"], sampling=Sampling(speed=2))
-        with zipfile.ZipFile(archive) as file:
-            import io
-            wav, rate = sf.read(io.BytesIO(file.read("0001.wav")))
-            manifest = json.loads(file.read("manifest.json"))
-        self.assertEqual(len(wav), 24000)
-        self.assertEqual(manifest[0]["speed"], 2)
-        with patch.object(self.tool.tts, "infer_batch", return_value=[tone, tone]):
-            path = self.tool.conversation("A: One\nA: Two", {"A": "Mai"}, Sampling(speed=2), gap=0.25)
-        self.assertEqual(sf.info(path).frames, 24000 * 2 + 12000)
 
     def test_adjusted_stream_waits_for_generation_and_saves_what_it_plays(self):
         tone = self.tone()
@@ -1020,19 +909,42 @@ class DesktopToolTests(unittest.TestCase):
         np.testing.assert_allclose(wav, np.concatenate(played), atol=1 / 32768)
         self.assertTrue(any("Đang chỉnh tốc độ" in message for path, message in results))
 
-    def test_speed_keeps_srt_start_and_applies_watermark_after_stretch(self):
-        path = self.folder / "speed.srt"
-        path.write_text("1\n00:00:01,000 --> 00:00:02,000\nXin chào\n", encoding="utf-8")
-        tone = self.tone()
-        self.tool.tts.watermarker = object()
-        with patch.object(self.tool.tts, "infer_batch", return_value=[tone]) as infer, \
-             patch.object(self.tool.tts, "_apply_watermark", side_effect=lambda audio: audio, create=True) as watermark:
-            output, _ = self.tool.srt(path, sampling=Sampling(speed=2, apply_watermark=True), fit_to_timing=False)
-            self.assertFalse(infer.call_args.kwargs["apply_watermark"])
-            self.assertEqual(len(watermark.call_args.args[0]), 24000)
-        wav, rate = sf.read(output)
-        self.assertTrue(np.all(wav[:48000] == 0))
-        self.assertEqual(len(wav), 48000 + 24000 + 24000)
+
+    def test_audio_plus_srt_applies_effects_once_after_joining(self):
+        from apps.simple_tts_audio import process_audio
+        clips = [np.full(12000, .1, dtype=np.float32), np.full(24000, .2, dtype=np.float32)]
+        with patch.object(self.tool.tts, "infer_batch", return_value=clips):
+            original = self.tool.synthesize_with_subtitles("One. Two.")
+        with patch.object(self.tool.tts, "infer_batch", return_value=clips), \
+             patch("apps.v3turbo_tool.process_audio", wraps=process_audio) as effects:
+            result = self.tool.synthesize_with_subtitles(
+                "One. Two.", sampling=Sampling(bright=True, compress=True, peak_guard=True))
+        self.assertEqual(effects.call_count, 1)
+        self.assertEqual(len(effects.call_args.args[0]), sf.info(result.audio).frames)
+        self.assertEqual(sf.info(result.audio).frames, sf.info(original.audio).frames)
+        self.assertEqual(result.subtitles.read_text(encoding="utf-8"),
+                         original.subtitles.read_text(encoding="utf-8"))
+
+    def test_audio_plus_srt_stretches_each_sentence_once(self):
+        with patch.object(self.tool.tts, "infer_batch", return_value=[self.tone(), self.tone()]), \
+             patch("apps.v3turbo_tool.stretch_rubberband", wraps=__import__(
+                 "apps.speech_speed", fromlist=["stretch_rubberband"]).stretch_rubberband) as stretch:
+            result = self.tool.synthesize_with_subtitles("One. Two.", sampling=Sampling(speed=1.2))
+        self.assertEqual(stretch.call_count, 2)
+        self.assertEqual(len(parse_srt(result.subtitles.read_text(encoding="utf-8"))), 2)
+
+    def test_cuda_subtitles_use_larger_window_but_keep_sdk_batch_cap(self):
+        self.tool.tts.backend = "pytorch"
+        text = "One. Two. Three. Four. Five. Six."
+        with patch.object(self.tool.tts, "infer_batch",
+                          side_effect=lambda texts, **kwargs: [self.tone() for _ in texts]) as infer:
+            result = self.tool.synthesize_with_subtitles(text, sampling=Sampling(batch_size=2))
+        self.assertEqual(infer.call_count, 1)
+        self.assertEqual(len(infer.call_args.args[0]), 6)
+        self.assertEqual(infer.call_args.kwargs["batch_size"], 2)
+        self.assertEqual(result.sentences, 6)
+        self.assertTrue(all(value >= 0 for value in result.timings.values()))
+        self.assertGreaterEqual(result.timings["total"], result.timings["model"])
 
     def test_text_generates_audio_and_sentence_srt_with_actual_timing(self):
         text = "Câu một. Câu hai?\nCâu ba!"

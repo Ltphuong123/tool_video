@@ -2,28 +2,30 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterator
 import json
 import math
 import re
 import tempfile
+from time import perf_counter
 import threading
 import uuid
-import zipfile
 
 import numpy as np
 import soundfile as sf
 
 from apps.speech_speed import require_rubberband, stretch_rubberband
+from apps.simple_tts_engine import generate_speech
+from apps.simple_tts_audio import AudioOptions, build_effect_chain, process_audio
 from apps.srt_speech import concatenate, lay_on_timeline, parse_srt
 from apps.srt_timing import (
-    cue_sample_windows, prepare_srt_clip, soften_srt_tail,
+    cue_sample_windows, prepare_srt_clip,
 )
 from apps.speech_subtitles import assemble_sentence_track, render_srt, subtitle_sentences
 from apps.user_voices import (
-    USER_MARK, _entry_from_json, _entry_to_json,
+    _entry_from_json,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +49,7 @@ class SubtitledSpeech:
     subtitles: Path
     sentences: int
     duration: float
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -68,9 +71,10 @@ class Sampling:
     max_new_frames: int = 300
     max_chars: int = 256
     batch_size: int = 8
-    denoise: bool = True
     use_ref_codes: bool = True
-    apply_watermark: bool = False
+    bright: bool = False
+    compress: bool = False
+    peak_guard: bool = False
 
     def kwargs(self, streaming: bool = False) -> dict:
         ranges = {
@@ -90,7 +94,9 @@ class Sampling:
         if streaming:
             values.pop("batch_size")
         # v3 Turbo ignores speed; the desktop tool stretches the resulting audio.
-        values.pop("speed")
+        for key in ("speed", "bright", "compress", "peak_guard"):
+            values.pop(key)
+        values.update(denoise=False, apply_watermark=False)
         return values
 
 
@@ -110,23 +116,6 @@ def read_document(path: str | Path) -> str:
     return text
 
 
-def parse_conversation(script: str, mapping: dict[str, str]) -> list[tuple[str, str]]:
-    lines = []
-    for index, raw in enumerate(script.splitlines(), 1):
-        if not raw.strip():
-            continue
-        speaker, sep, text = raw.partition(":")
-        if not sep or not text.strip():
-            raise ValueError(f"Dòng {index}: dùng định dạng Nhân vật: lời thoại.")
-        voice = mapping.get(speaker.strip())
-        if not voice:
-            raise ValueError(f"Chưa chọn giọng cho '{speaker.strip()}'.")
-        lines.append((voice, text.strip()))
-    if not lines:
-        raise ValueError("Hãy nhập kịch bản hội thoại.")
-    return lines
-
-
 class TurboTool:
     def __init__(self, output_dir: str | Path | None = None, factory=None,
                  settings_path: str | Path | None = None):
@@ -143,6 +132,7 @@ class TurboTool:
         self.output_dirs = tuple(dict.fromkeys([*previous, initial]))
         self.tts = None
         self._factory = factory
+        self._model_settings = None
         self._lock = threading.Lock()
         self.stop_event = threading.Event()
 
@@ -284,6 +274,8 @@ class TurboTool:
 
     def load(self, **settings) -> str:
         with self.operation(require_model=False):
+            if self.tts is not None and self._model_settings == settings:
+                return f"v3 Turbo ready: {self.tts.backend} (cached)"
             if self.tts is not None:
                 self.tts.close()
                 self.tts = None
@@ -304,8 +296,8 @@ class TurboTool:
                 model.close()
                 raise
             self.tts = model
-            watermark = "sẵn sàng" if model.watermarker else "chưa cài"
-            return f"Đã tải v3 Turbo · {model.backend} · 48 kHz · {len(model._preset_voices)} giọng · watermark {watermark}"
+            self._model_settings = dict(settings)
+            return f"Đã tải v3 Turbo · {model.backend} · 48 kHz · {len(model._preset_voices)} giọng"
 
     def unload(self):
         with self.operation(require_model=False):
@@ -327,24 +319,29 @@ class TurboTool:
 
     def _sampling(self, sampling: Sampling, streaming=False):
         kw = sampling.kwargs(streaming)
-        if sampling.apply_watermark and not self.tts.watermarker:
-            raise ValueError("Watermark chưa khả dụng. Cài: uv sync --extra watermark")
         if sampling.speed != 1.0:
             require_rubberband()
-            # Apply the watermark after time stretching so it marks the final audio.
-            kw["apply_watermark"] = False
+        if sampling.bright or sampling.compress:
+            from apps.simple_tts_audio import pedalboard_module
+            pedalboard_module()
         return kw
 
-    def _adjust_speed(self, audio, sampling: Sampling) -> np.ndarray:
+    def _effects(self, audio, sampling: Sampling, effects_chain=None):
+        if not (sampling.bright or sampling.compress or sampling.peak_guard):
+            return audio
+        self.check_stop()
+        wav, _ = process_audio(audio, 48000, AudioOptions(
+            bright=sampling.bright, compress=sampling.compress, peak_guard=sampling.peak_guard),
+                               effects_chain=effects_chain)
+        return wav
+
+    def _adjust_speed(self, audio, sampling: Sampling, effects_chain=None) -> np.ndarray:
         self.check_stop()
         wav = np.asarray(audio, dtype=np.float32).reshape(-1)
-        if sampling.speed == 1.0 or not wav.size:
-            return wav
-        wav = stretch_rubberband(wav, sampling.speed, check_stop=self.check_stop)
-        self.check_stop()
-        if sampling.apply_watermark:
-            wav = self.tts._apply_watermark(wav)
-        return np.asarray(wav, dtype=np.float32)
+        if sampling.speed != 1.0 and wav.size:
+            wav = stretch_rubberband(wav, sampling.speed, check_stop=self.check_stop)
+            self.check_stop()
+        return self._effects(wav, sampling, effects_chain)
 
     def _path(self, label: str, suffix: str) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -363,6 +360,16 @@ class TurboTool:
         sf.write(path, wav, rate, format=fmt.upper(), **({"subtype": "PCM_16"} if fmt != "mp3" else {}))
         return path
 
+    def _generate_audio(self, text, reference, kwargs, *, batch=False):
+        self.check_stop()
+        result = generate_speech(text, model=self.tts, save=False, batch=batch,
+                                 inference_kwargs=kwargs, **reference)
+        self.check_stop()
+        results = result if batch else [result]
+        if any(item.sample_rate != 48000 for item in results):
+            raise ValueError("Tool desktop cần audio Turbo 48 kHz.")
+        return [item.audio for item in results] if batch else result.audio
+
     def synthesize(self, text: str, voice=None, ref_audio=None, sampling=None, fmt="wav") -> Path:
         if not text.strip():
             raise ValueError("Hãy nhập văn bản.")
@@ -370,29 +377,51 @@ class TurboTool:
         with self.operation():
             kw = self._sampling(sampling)
             ref = self._reference(voice, ref_audio)
-            audio = self.tts.infer(text, **ref, **kw)
+            audio = self._generate_audio(text, ref, kw)
             self.check_stop()
             return self._save(self._adjust_speed(audio, sampling), fmt)
 
 
+    def synthesize_many(self, texts, voice=None, sampling=None, fmt="wav"):
+        """Queue batch: use one SDK batch, exporting ordinary speech files."""
+        if not texts or any(not text.strip() for text in texts):
+            raise ValueError("Mỗi mục phải có văn bản.")
+        sampling = sampling or Sampling()
+        with self.operation():
+            audio = self._generate_audio(texts, self._reference(voice, None), self._sampling(sampling), batch=True)
+            paths = []
+            for wav in audio:
+                self.check_stop()
+                paths.append(self._save(self._adjust_speed(wav, sampling), fmt))
+            return paths
+
     def synthesize_with_subtitles(self, text: str, voice=None, ref_audio=None, sampling=None,
                                   fmt="wav", progress: Callable = lambda message: None) -> SubtitledSpeech:
+        started = perf_counter()
+        model_seconds = 0.0
         sentences = subtitle_sentences(text)
         sampling = sampling or Sampling()
         with self.operation():
             kw = self._sampling(sampling)
             ref = self._reference(voice, ref_audio)
+            speed_sampling = replace(sampling, bright=False, compress=False, peak_guard=False)
             clips = []
-            for start in range(0, len(sentences), sampling.batch_size):
+            window = min(128, sampling.batch_size * 4) if self.tts.backend == "pytorch" else sampling.batch_size
+            for start in range(0, len(sentences), window):
                 self.check_stop()
-                group = [sentence for sentence, gap in sentences[start:start + sampling.batch_size]]
-                wavs = self.tts.infer_batch(group, **ref, **kw)
+                group = [sentence for sentence, gap in sentences[start:start + window]]
+                batch_started = perf_counter()
+                wavs = self._generate_audio(group, ref, kw, batch=True)
+                model_seconds += perf_counter() - batch_started
                 if len(wavs) != len(group):
                     raise RuntimeError("Số audio trả về không khớp số câu để tạo phụ đề.")
-                clips.extend(self._adjust_speed(wav, sampling) for wav in wavs)
+                clips.extend(self._adjust_speed(wav, speed_sampling) for wav in wavs)
                 progress(f"Audio + SRT: đã đọc {len(clips)}/{len(sentences)} câu")
             self.check_stop()
             track, spans = assemble_sentence_track(sentences, clips)
+            del clips, wavs
+            track = self._effects(track, sampling)
+            self.check_stop()
             srt_text = render_srt(spans)
             audio_path = subtitle_path = None
             try:
@@ -406,7 +435,10 @@ class TurboTool:
                 if subtitle_path is not None:
                     subtitle_path.unlink(missing_ok=True)
                 raise
-            return SubtitledSpeech(audio_path, subtitle_path, len(sentences), len(track) / 48000)
+            elapsed = perf_counter() - started
+            return SubtitledSpeech(audio_path, subtitle_path, len(sentences), len(track) / 48000,
+                                   {"total": elapsed, "model": model_seconds,
+                                    "other": max(0.0, elapsed - model_seconds)})
 
     def stream(self, text: str, voice=None, ref_audio=None, sampling=None,
                on_audio: Callable | None = None) -> Iterator[tuple[Path | None, str]]:
@@ -419,7 +451,7 @@ class TurboTool:
             path = self._path("stream", ".wav")
             iterator = self.tts.infer_stream(text, **ref, **kw)
             frames = 0
-            buffered = sampling.speed != 1.0
+            buffered = sampling.speed != 1.0 or sampling.bright or sampling.compress or sampling.peak_guard
             mode = "Đang tạo audio để chỉnh tốc độ" if buffered else "Đang streaming"
             try:
                 # Raw float bytes avoid encoding/decoding a temporary WAV. Large
@@ -467,66 +499,12 @@ class TurboTool:
                 if close:
                     close()
 
-    def batch(self, texts: list[str], voice=None, ref_audio=None, sampling=None, fmt="wav",
-              progress: Callable = lambda message: None) -> Path:
-        if not texts or any(not text.strip() for text in texts):
-            raise ValueError("Mỗi mục trong batch phải có văn bản.")
-        sampling = sampling or Sampling()
-        with self.operation():
-            kw = self._sampling(sampling)
-            ref = self._reference(voice, ref_audio)
-            paths = []
-            manifest = []
-            for start in range(0, len(texts), sampling.batch_size):
-                self.check_stop()
-                group = texts[start:start + sampling.batch_size]
-                wavs = self.tts.infer_batch(group, **ref, **kw)
-                if len(wavs) != len(group):
-                    raise RuntimeError("Số audio trả về không khớp số văn bản.")
-                self.check_stop()
-                for index, (text, wav) in enumerate(zip(group, wavs), start + 1):
-                    path = self._save(self._adjust_speed(wav, sampling), fmt, label=f"batch_{index:04}")
-                    paths.append(path)
-                    manifest.append({"index": index, "text": text, "audio": f"{index:04}.{fmt}",
-                                     "speed": sampling.speed, "speed_method": "rubberband"})
-                progress(f"Đã tạo {len(paths)}/{len(texts)} audio")
-            archive = self._path("batch", ".zip")
-            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as out:
-                for index, path in enumerate(paths, 1):
-                    out.write(path, f"{index:04}.{fmt}")
-                out.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            return archive
-
-    def conversation(self, script, mapping, sampling=None, gap=0.4, fmt="wav",
-                     progress: Callable = lambda message: None):
-        lines = parse_conversation(script, mapping)
-        if not math.isfinite(gap) or not 0 <= gap <= 10:
-            raise ValueError("Khoảng nghỉ phải nằm trong 0–10 giây.")
-        sampling = sampling or Sampling()
-        with self.operation():
-            kw = self._sampling(sampling)
-            for voice in dict.fromkeys(voice for voice, _ in lines):
-                self._reference(voice, None)
-            clips = []
-            start = 0
-            while start < len(lines):
-                self.check_stop()
-                voice = lines[start][0]
-                end = start + 1
-                while end < min(len(lines), start + sampling.batch_size) and lines[end][0] == voice:
-                    end += 1
-                wavs = self.tts.infer_batch([text for _, text in lines[start:end]], voice=voice, **kw)
-                if len(wavs) != end - start:
-                    raise RuntimeError("Số audio trả về không khớp số lượt hội thoại.")
-                for index, wav in enumerate(wavs, start + 1):
-                    clips.append(self._adjust_speed(wav, sampling))
-                    progress(f"Hội thoại {index}/{len(lines)} · {voice}")
-                start = end
-            self.check_stop()
-            return self._save(concatenate(clips, 48000, gap), fmt, label="conversation")
 
     def srt(self, path, voice=None, sampling=None, keep_timing=True, fmt="wav",
             progress: Callable = lambda message: None, fit_to_timing=None, min_speed=None):
+        started = perf_counter()
+        model_seconds = 0.0
+        processing_seconds = 0.0
         if fit_to_timing is None:
             fit_to_timing = bool(keep_timing)
         if fit_to_timing and not keep_timing:
@@ -548,18 +526,21 @@ class TurboTool:
         with self.operation():
             kw = self._sampling(sampling)
             if fit_to_timing:
-                # All speed adjustments finish before marking the final clip.
-                kw["apply_watermark"] = False
                 progress(f"Bộ chỉnh tốc độ SRT: rubberband · tốc độ ban đầu {sampling.speed:.2f}x.")
             ref = self._reference(voice, None)
+            effects_chain = build_effect_chain(AudioOptions(bright=sampling.bright, compress=sampling.compress))
             clips = []
             track = (np.zeros(max(cue.end_ms for cue in cues) * 48000 // 1000, dtype=np.float32)
                      if fit_to_timing else None)
             accelerated, max_speed = 0, sampling.speed
-            for start in range(0, len(cues), sampling.batch_size):
+            window = min(128, sampling.batch_size * 4) if self.tts.backend == "pytorch" else sampling.batch_size
+            for start in range(0, len(cues), window):
                 self.check_stop()
-                group = cues[start:start + sampling.batch_size]
-                wavs = self.tts.infer_batch([cue.text for cue in group], **ref, **kw)
+                group = cues[start:start + window]
+                batch_started = perf_counter()
+                wavs = self._generate_audio([cue.text for cue in group], ref, kw, batch=True)
+                model_seconds += perf_counter() - batch_started
+                processing_started = perf_counter()
                 if len(wavs) != len(group):
                     raise RuntimeError("Số audio không khớp số câu SRT.")
                 for offset, wav in enumerate(wavs):
@@ -575,17 +556,12 @@ class TurboTool:
                         progress(f"SRT câu {cue.index}: bắt đầu {begin / 48000:.3f}s, "
                                  f"kết thúc {(begin + len(audio)) / 48000:.3f}s / giới hạn {end / 48000:.3f}s, "
                                  f"tốc độ {speed:.2f}x")
-                        if sampling.apply_watermark:
-                            expected = len(audio)
-                            audio = np.asarray(self.tts._apply_watermark(audio), dtype=np.float32).reshape(-1)
-                            if len(audio) != expected:
-                                raise ValueError("Watermark thay đổi độ dài audio; hãy tắt watermark khi căn thời gian SRT.")
-                        audio = soften_srt_tail(audio)
+                        audio = self._effects(audio, sampling, effects_chain)
                         if len(audio) > end - begin:
                             raise ValueError(f"Câu SRT {cue.index}: audio chưa vừa khung thời gian.")
                         track[begin:begin + len(audio)] = audio
                     else:
-                        audio = self._adjust_speed(wav, sampling)
+                        audio = self._adjust_speed(wav, sampling, effects_chain)
                         clips.append(audio)
                 progress(f"SRT {start + len(group)}/{len(cues)} câu")
             self.check_stop()
@@ -598,9 +574,16 @@ class TurboTool:
             else:
                 track = concatenate(clips, 48000)
                 note = "Các câu nối tiếp, nghỉ 0,5 giây."
-            return self._save(track, fmt, label="srt"), note
+            if not np.any(np.abs(track) >= 1 / 32768):
+                raise ValueError("Audio SRT không có tín hiệu nghe được; không xuất file im lặng.")
+            note += f" Câu đầu ở {cues[0].start_ms / 1000:.3f}s; phần trước là khoảng lặng theo mốc SRT."
+            export_started = perf_counter()
+            output = self._save(track, fmt, label="srt")
+            note += (f" Total={perf_counter() - started:.2f}s; model={model_seconds:.2f}s; "
+                     f"tempo/effects={processing_seconds:.2f}s; export={perf_counter() - export_started:.2f}s.")
+            return output, note
 
-    def edit_video(self, path, start, end, speed=1.5, ramp_seconds=0.5, keep_audio=True,
+    def edit_video(self, path, start, end, speed=1.5, ramp_seconds=0.5, keep_audio=False,
                    quality=20, preset="fast", progress: Callable = lambda message: None):
         values = (start, end, speed, ramp_seconds)
         if not all(math.isfinite(float(value)) for value in values):
@@ -633,7 +616,7 @@ class TurboTool:
                 note += f" Video xuất {result.output_duration:.2f}s."
             return destination, note
 
-    def edit_video_segments(self, path, segments, keep_audio=True, quality=20,
+    def edit_video_segments(self, path, segments, keep_audio=False, quality=20,
                             preset="fast", progress: Callable = lambda message: None):
         """Render a snapshot of several source-time ranges without loading TTS."""
         from apps.video_editor import SpeedSegment, render_speed_segments
@@ -675,7 +658,7 @@ class TurboTool:
                 note += f" Video xuất {result.output_duration:.2f}s."
             return destination, note
 
-    def edit_video_markers(self, path, old_markers, new_markers, keep_audio=True,
+    def edit_video_markers(self, path, old_markers, new_markers, keep_audio=False,
                            quality=20, preset="fast", progress: Callable = lambda message: None):
         """Align a snapshot of numbered source and target anchors in a new MP4."""
         from apps.video_markers import validate_marker_pairs
@@ -703,96 +686,3 @@ class TurboTool:
             if result is not None:
                 note += f" Video xuất {result.output_duration:.3f}s."
             return destination, note
-
-    def _persist_voices(self):
-        self.voices_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"presets": {name: _entry_to_json(v) for name, v in self.tts._preset_voices.items()
-                            if v.get(USER_MARK)}}
-        temp = self.voices_path.with_suffix(".tmp")
-        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(self.voices_path)
-
-    def add_voice(self, name, audio, description="", denoise=True, use_ref_codes=True):
-        name = name.strip()
-        if not name or len(name) > 40:
-            raise ValueError("Tên giọng phải có 1–40 ký tự.")
-        if not audio:
-            raise ValueError("Hãy chọn audio mẫu.")
-        with self.operation():
-            self._reference(None, audio)
-            canonical = self.tts.resolve_voice_name(name)
-            if canonical and not self.tts._preset_voices[canonical].get(USER_MARK):
-                raise ValueError("Tên này trùng giọng có sẵn hoặc bí danh của giọng có sẵn.")
-            self.tts.add_voice(name, audio, description=description, denoise=denoise,
-                               use_ref_codes=use_ref_codes)
-            self.tts._preset_voices[name][USER_MARK] = True
-            self._persist_voices()
-
-    def delete_voice(self, name):
-        with self.operation():
-            if not self.tts._preset_voices.get(name, {}).get(USER_MARK):
-                raise ValueError("Chỉ xóa được giọng do bạn lưu.")
-            self.tts.remove_voice(name)
-            self._persist_voices()
-
-    def export_voices(self):
-        with self.operation():
-            path = self._path("voices", ".json")
-            self.tts.save_voices(path)
-            return path
-
-    def denoise(self, audio):
-        if not audio:
-            raise ValueError("Hãy chọn audio mẫu.")
-        with self.operation():
-            self._reference(None, audio)
-            wav, rate = self.tts.denoise(audio)
-            self.check_stop()
-            return self._save(wav, "wav", rate, label="denoised")
-
-    def export_reference(self, audio, denoise=True):
-        if not audio:
-            raise ValueError("Hãy chọn audio mẫu.")
-        with self.operation():
-            self._reference(None, audio)
-            speaker, codes = self.tts.encode_reference(audio, denoise=denoise)
-            self.check_stop()
-            path = self._path("reference", ".npz")
-            np.savez_compressed(path, speaker_emb=np.asarray(speaker), ref_codes=np.asarray(codes))
-            return path
-
-    def import_voices(self, path):
-        with self.operation():
-            data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-            presets = data.get("presets")
-            if not isinstance(presets, dict) or not presets:
-                raise ValueError("JSON phải chứa đối tượng presets có ít nhất một giọng.")
-            entries, skipped = {}, 0
-            for name, raw in presets.items():
-                if not isinstance(name, str) or not name.strip() or len(name) > 40:
-                    raise ValueError("Tên giọng trong JSON phải có 1–40 ký tự.")
-                existing = self.tts.resolve_voice_name(name)
-                if existing and not self.tts._preset_voices[existing].get(USER_MARK):
-                    skipped += 1
-                    continue
-                if not isinstance(raw, dict):
-                    raise ValueError(f"Giọng '{name}' có dữ liệu không hợp lệ.")
-                embedding = np.asarray(raw.get("speaker_emb"), dtype=np.float32)
-                if embedding.shape != (192,) or not np.isfinite(embedding).all() or not embedding.any():
-                    raise ValueError(f"Giọng '{name}' cần speaker_emb gồm 192 số hữu hạn, khác zero.")
-                codes = raw.get("codes")
-                if codes is not None:
-                    codes = np.asarray(codes)
-                    if codes.ndim != 2 or codes.shape[1] != 16 or not codes.size:
-                        raise ValueError(f"Giọng '{name}': codes phải có kích thước [frames, 16].")
-                    if not np.isfinite(codes).all() or np.any(codes < 0) or np.any(codes > 1023) or np.any(codes != codes.astype(np.int64)):
-                        raise ValueError(f"Giọng '{name}': codes phải là số nguyên 0–1023.")
-                entries[name] = _entry_from_json(self.tts, raw)
-            previous = dict(self.tts._preset_voices)
-            self.tts._preset_voices.update(entries)
-            try:
-                self._persist_voices()
-            except Exception:
-                self.tts._preset_voices = previous
-                raise
-            return f"Đã nhập {len(entries)} giọng riêng; bỏ qua {skipped} giọng có sẵn."

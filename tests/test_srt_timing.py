@@ -6,7 +6,7 @@ import numpy as np
 from apps.srt_speech import Cue, parse_srt
 from apps.srt_timing import (
     cue_sample_windows, fit_clip_to_samples, lay_fitted_timeline, prepare_srt_clip,
-    rubberband_to_samples, soften_srt_tail, trim_srt_silence,
+    rubberband_to_samples, trim_srt_silence,
 )
 
 
@@ -82,16 +82,6 @@ class SrtTimingTests(unittest.TestCase):
                     found = np.fft.rfftfreq(len(middle), 1 / rate)[spectrum.argmax()]
                     self.assertAlmostEqual(found, pitch, delta=5)
 
-    def test_tail_fade_removes_abrupt_end_without_shifting_start_or_samples(self):
-        voice = np.concatenate((np.full(48000, 0.118, dtype=np.float32), np.zeros(9600, dtype=np.float32)))
-        original = voice.copy()
-        output = soften_srt_tail(voice)
-        np.testing.assert_array_equal(output[:47760], voice[:47760])
-        self.assertEqual(len(output), len(voice))
-        self.assertEqual(output[47999], 0)
-        self.assertTrue(np.all(output[48000:] == 0))
-        self.assertLess(float(np.abs(np.diff(output[47759:48001])).max()), .001)
-        np.testing.assert_array_equal(voice, original)
 
     def test_rubberband_validation_and_cancellation(self):
         for voice, target in (([], 10), ([np.nan], 10), ([0.1], 0), ([0.1], 1.5)):

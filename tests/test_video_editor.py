@@ -330,11 +330,26 @@ class MoviePyRenderTests(unittest.TestCase):
     def tearDown(self):
         self.folder.cleanup()
 
+    def test_default_export_omits_audio_for_ramps_and_immediate_changes(self):
+        from moviepy import VideoFileClip
+        for ramp in (0.0, 0.2):
+            with self.subTest(ramp=ramp):
+                output = self.directory / f"silent_{ramp}.mp4"
+                with patch("apps.video_editor._encode_audio", side_effect=AssertionError("unused")), \
+                     patch("apps.video_export_audio.encode_mapped_audio", side_effect=AssertionError("unused")):
+                    mapping = render_speed_segment(self.source, output, 0.5, 1.5, 1.5, ramp,
+                                                   preset="ultrafast")
+                with VideoFileClip(str(output)) as result:
+                    self.assertIsNone(result.audio)
+                    self.assertEqual(result.get_frame(0).shape, (48, 64, 3))
+                    self.assertAlmostEqual(result.duration, mapping.output_duration, delta=0.12)
+                self.assertFalse(list(self.directory.glob(".video_*")))
+
     def test_real_multi_render_keeps_audio_fps_and_frames_in_middle_gap(self):
         from moviepy import VideoFileClip
         output = self.directory / "multiple.mp4"
         segments = [SpeedSegment(0.2, 0.7, 2, 0.1), SpeedSegment(1.2, 1.7, 0.5, 0.1)]
-        mapping = render_speed_segments(self.source, output, segments, preset="ultrafast")
+        mapping = render_speed_segments(self.source, output, segments, keep_audio=True, preset="ultrafast")
         information = probe_video(output)
         self.assertEqual(information["fps"], 12)
         self.assertTrue(information["has_audio"])
@@ -379,7 +394,7 @@ class MoviePyRenderTests(unittest.TestCase):
         with patch("apps.speech_speed.require_rubberband", side_effect=AssertionError("unused")):
             mapping = render_speed_segments(
                 self.source, output, [SpeedSegment(0.2, 0.7, 1, 0.1), SpeedSegment(1.2, 1.7, 1, 0.1)],
-                preset="ultrafast",
+                keep_audio=True, preset="ultrafast",
             )
         self.assertEqual(mapping.output_duration, 2)
         self.assertTrue(probe_video(output)["has_audio"])
@@ -389,7 +404,7 @@ class MoviePyRenderTests(unittest.TestCase):
         output = self.directory / "ramped.mp4"
         progress = []
         mapping = render_speed_segment(self.source, output, 0.5, 1.5, 1.5, 0.25,
-                                       preset="ultrafast", progress=progress.append)
+                                       keep_audio=True, preset="ultrafast", progress=progress.append)
         information = probe_video(output)
         self.assertEqual(information["fps"], 12)
         self.assertEqual((information["width"], information["height"]), (64, 48))
@@ -409,7 +424,7 @@ class MoviePyRenderTests(unittest.TestCase):
     def test_original_speed_requires_no_rubberband(self):
         output = self.directory / "same_speed.mp4"
         with patch("apps.speech_speed.require_rubberband", side_effect=AssertionError("unused")):
-            mapping = render_speed_segment(self.source, output, 0.5, 1.5, 1, 0.25, preset="ultrafast")
+            mapping = render_speed_segment(self.source, output, 0.5, 1.5, 1, 0.25, keep_audio=True, preset="ultrafast")
         self.assertEqual(mapping.output_duration, 2)
         self.assertTrue(probe_video(output)["has_audio"])
 
@@ -465,7 +480,7 @@ class MoviePyRenderTests(unittest.TestCase):
         output = self.directory / "cancelled_audio.mp4"
         with self.assertRaises(Cancelled):
             render_speed_segment(self.source, output, 0.5, 1.5, 1.5, 0.25,
-                                 preset="ultrafast", check_stop=check_stop, progress=progress)
+                                 keep_audio=True, preset="ultrafast", check_stop=check_stop, progress=progress)
         self.assertFalse(output.exists())
         self.assertFalse(list(self.directory.glob(".video_*")))
 
@@ -502,7 +517,8 @@ class MoviePyRenderTests(unittest.TestCase):
             seen.update(kwargs)
             return original_write(instance, *args, **kwargs)
 
-        with patch.object(VideoClip, "write_videofile", write):
+        with patch.object(VideoClip, "write_videofile", write), \
+             patch("apps.video_fast_export.can_render_ffmpeg", return_value=False):
             render_speed_segment(fractional, output, 0.2, 0.8, 1.5, 0.2, preset="ultrafast")
         parameters = seen["ffmpeg_params"]
         actual_clock = parameters[parameters.index("-r") + 1]

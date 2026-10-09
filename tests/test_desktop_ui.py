@@ -1,7 +1,6 @@
 """Desktop workflow checks without model downloads or audio device access."""
 from __future__ import annotations
 
-import atexit
 from pathlib import Path
 import tempfile
 import time
@@ -33,7 +32,7 @@ class FakeVideoPreview(ttk.Frame):
         self.on_position = on_position or (lambda seconds, playing: None)
         self.open = Mock()
         self.set_segments = Mock()
-        self.set_audio_enabled = Mock()
+        self.set_audio_enabled = Mock(side_effect=lambda enabled: self.on_position(self.position, self.playing))
         self.seek = Mock(side_effect=self._seek)
         self.play = Mock(side_effect=lambda: setattr(self, "playing", True))
         self.pause = Mock(side_effect=lambda: setattr(self, "playing", False))
@@ -97,9 +96,7 @@ class DesktopUITests(unittest.TestCase):
         for identifier in self.root.tk.call("after", "info"):
             self.root.after_cancel(identifier)
         self.app.busy = False
-        self.app.recorder = None
         self.app.close()
-        atexit.unregister(self.app._terminate_children)
 
     def _paths(self):
         return set(self.app.audio_files.values())
@@ -157,8 +154,173 @@ class DesktopUITests(unittest.TestCase):
         self.app.video_ramp.set(str(ramp))
         self.app.add_video_segment()
 
+    def test_text_and_srt_hide_storage_and_reference(self):
+        self.assertFalse(hasattr(self.app, "reference"))
+        self.assertIs(self.app.speech_speed, self.app.vars["speed"])
+        for page in ("Văn bản", "SRT"):
+            self.app.book.select(self.app.pages[page])
+            self.app._page_changed()
+            self.assertEqual(self.app.storage_bar.winfo_manager(), "")
+        self.app.book.select(self.app.pages["Cấu hình"])
+        self.app._page_changed()
+        self.assertEqual(self.app.storage_bar.winfo_manager(), "pack")
+
+    def test_many_texts_and_file_dialog_queue_inputs(self):
+        self.app.speech.delete("1.0", "end")
+        self.app.speech.insert("1.0", "One paragraph.\n\nMore words.\n===\nTwo.\n===\n")
+        self.app.add_text_queue()
+        tasks = self.app.queue_panels["Văn bản"].tasks
+        self.assertEqual([task.text for task in tasks], ["One paragraph.\n\nMore words.\n===\nTwo.\n==="])
+        paths = (str(self.folder / "a.txt"), str(self.folder / "b.txt"))
+        with patch("apps.v3turbo_desktop.filedialog.askopenfilenames", return_value=paths):
+            self.app.choose_queue_files("Văn bản")
+        self.assertEqual([task.source for task in tasks[-2:]], [Path(path) for path in paths])
+        with patch("apps.v3turbo_desktop.filedialog.askopenfilenames", return_value=(str(self.subtitle),)):
+            self.app.choose_queue_files("SRT")
+        self.assertEqual(self.app.queue_panels["SRT"].tasks[0].source, self.subtitle)
+
+    def test_text_queue_generates_separate_files_and_stays_in_tab(self):
+        from test_v3turbo_desktop import FakeTurbo
+        from apps.desktop_queue import QueueTask
+        self.tool._factory = FakeTurbo
+        self.tool.load()
+        self.app.refresh_voices()
+        self.app.speech_speed.set("1.0")
+        panel = self.app.queue_panels["Văn bản"]
+        for label, text in [("one", "Hello"), ("bad", ""), ("two", "World")]:
+            panel.add(QueueTask(label, text=text))
+        self.app.start_queue("Văn bản")
+        self.assertTrue(self._pump_until(lambda: not self.app.busy))
+        states = [panel.rows[task.identifier]["state"] for task in panel.tasks]
+        self.assertEqual(states, ["done", "error", "done"])
+        self.assertEqual(len(list(self.destination.glob("speech_*.wav"))), 4)
+        self.assertEqual(self.app.book.select(), str(self.app.pages["Văn bản"]))
+        self.assertEqual(len(list(self.destination.glob("speech_subtitled_*.srt"))), 3)
+        self.assertEqual(len(panel.pending()), 1)
+        self.assertEqual(len(self.app.inline_histories["Văn bản"][1]), 4)
+
+    def test_srt_queue_progress_speed_and_inline_history(self):
+        from apps.desktop_queue import QueueTask
+        panel = self.app.queue_panels["SRT"]
+        panel.add(QueueTask("first.srt", source=self.subtitle))
+        panel.add(QueueTask("second.srt", source=self.subtitle))
+        self.tool.tts = Mock()
+        self.app.srt_min_speed.set("0.8")
+        def fake_srt(path, voice, sampling, keep_timing, fmt, progress, **kwargs):
+            self.assertEqual(kwargs["min_speed"], 0.8)
+            self.assertTrue(kwargs["fit_to_timing"])
+            progress("SRT 1/2 câu")
+            result = self.tool._save([0, 0.1, 0], label="srt")
+            progress("SRT 2/2 câu")
+            return result, "done"
+        with patch.object(self.tool, "srt", side_effect=fake_srt), \
+             patch.object(self.app, "refresh_voices"):
+            self.app.start_queue("SRT")
+            self.assertTrue(self._pump_until(lambda: not self.app.busy))
+        self.tool.tts = None
+        self.assertEqual(len(self.app.inline_histories["SRT"][1]), 2)
+        for task in panel.tasks:
+            row = panel.rows[task.identifier]
+            self.assertEqual(row["state"], "done")
+            self.assertEqual(float(row["bar"]["value"]), 100)
+
+    def test_queue_rows_progress_remove_and_busy_guard(self):
+        from apps.desktop_queue import QueueTask
+        panel = self.app.queue_panels["SRT"]
+        task = QueueTask("test.srt", source=self.subtitle)
+        panel.add(task)
+        panel.update_task(task.identifier, "running", None)
+        panel.update_task(task.identifier, "progress", "SRT 3/10 câu")
+        self.assertEqual(float(panel.rows[task.identifier]["bar"]["value"]), 30)
+        panel.update_task(task.identifier, "cancelled", "stop")
+        self.assertEqual(panel.pending(), (task,))
+        panel.rows[task.identifier]["selected"].set(True)
+        self.app.busy = True
+        with self.assertRaises(RuntimeError):
+            self.app.remove_queue_items("SRT")
+        self.app.busy = False
+        self.app.remove_queue_items("SRT")
+        self.assertEqual(panel.tasks, [])
+
+    def test_removed_tabs_and_voice_refresh_are_pruned(self):
+        self.assertEqual(set(self.app.pages), {"Văn bản", "SRT", "Video", "Kết quả / Log", "Cấu hình"})
+        self.assertFalse(hasattr(self.app, "training_job"))
+        self.assertFalse(hasattr(self.app, "record_microphone"))
+        with patch.object(self.tool, "voice_names", wraps=self.tool.voice_names) as voices:
+            self.app.refresh_voices()
+            self.app.refresh_voices()
+            self.assertEqual(voices.call_count, 1)
+
+    def test_configuration_default_effects_and_hidden_reference_codes(self):
+        self.assertNotIn("use_ref_codes", self.app.vars)
+        sampling = self.app._sampling()
+        self.assertTrue(sampling.use_ref_codes)
+        self.assertTrue(sampling.bright and sampling.compress and sampling.peak_guard)
+        for key in ("bright", "compress", "peak_guard"):
+            self.app.vars[key].set(False)
+        sampling = self.app._sampling()
+        self.assertFalse(sampling.bright or sampling.compress or sampling.peak_guard)
+
+    def test_text_page_buttons_are_compact_and_queue_only(self):
+        labels = {str(button.cget("text")) for button in self.app.action_buttons}
+        for removed in ("Nhập TXT / PDF", "Tạo audio", "Audio + SRT từng câu", "Streaming và nghe", "Tách nhiều văn bản (===)"):
+            self.assertNotIn(removed, labels)
+        self.assertIn("Thêm văn bản", labels)
+        self.assertIn("Thêm TXT", labels)
+        self.assertIn("Chạy hàng đợi", labels)
+
+    def test_srt_history_playback_skips_initial_silence(self):
+        path = self.destination / "srt_000000000099.wav"
+        sf.write(path, [0, 0.1, 0], 48000)
+        self.app.refresh_history()
+        table, paths = self.app.inline_histories["SRT"]
+        selected = next(identifier for identifier, value in paths.items() if value == path)
+        table.selection_set(selected)
+        player = Mock()
+        with patch("apps.v3turbo_desktop.WavePlayer", return_value=player):
+            self.app.play_inline_history("SRT")
+            self.assertTrue(self._pump_until(lambda: not self.app.busy))
+        self.assertEqual(player.play_file.call_args.args, (path,))
+        self.assertTrue(player.play_file.call_args.kwargs["skip_initial_silence"])
+        self.assertTrue(callable(player.play_file.call_args.kwargs["on_start"]))
+
+    def test_inline_playback_uses_internal_player_without_opening_another_app(self):
+        table, paths = self.app.inline_histories["Văn bản"]
+        selected = next(identifier for identifier, path in paths.items() if path == self.speech)
+        table.selection_set(selected)
+        player = Mock()
+        with patch("apps.v3turbo_desktop.WavePlayer", return_value=player), \
+             patch.object(self.app, "_open_file") as external:
+            self.app.play_inline_history("Văn bản")
+            self.assertTrue(self._pump_until(lambda: not self.app.busy))
+        player.play_file.assert_called_once_with(self.speech)
+        external.assert_not_called()
+        self.assertIsNone(self.app.player)
+
+    def test_inline_delete_audio_and_paired_srt_refreshes_both_histories(self):
+        table, paths = self.app.inline_histories["Văn bản"]
+        selected = next(identifier for identifier, path in paths.items() if path == self.paired_audio)
+        table.selection_set(selected)
+        with patch("apps.v3turbo_desktop.messagebox.askyesno", return_value=False):
+            self.app.delete_inline_history("Văn bản")
+        self.assertTrue(self.paired_audio.exists())
+        with patch("apps.v3turbo_desktop.messagebox.askyesno", return_value=True):
+            self.app.delete_inline_history("Văn bản")
+        self.assertFalse(self.paired_audio.exists())
+        self.assertFalse(self.subtitle.exists())
+        self.assertTrue(self.speech.exists())
+        self.assertNotIn(self.paired_audio, self._paths())
+        self.assertNotIn(self.paired_audio, self.app.inline_histories["Văn bản"][1].values())
+
+    def test_inline_delete_rejects_running_job(self):
+        self.app.busy = True
+        with self.assertRaises(RuntimeError), patch("apps.v3turbo_desktop.messagebox.askyesno") as dialog:
+            self.app.delete_inline_history("Văn bản")
+        dialog.assert_not_called()
+        self.app.busy = False
+
     def test_startup_restores_generated_history_and_preserves_speed_controls(self):
-        self.assertEqual(len(self.app.pages), 9)
+        self.assertEqual(len(self.app.pages), 5)
         self.assertEqual(self.app.book.select(), str(self.app.pages["Văn bản"]))
         self.assertEqual(self._paths(), {
             self.speech, self.paired_audio, self.subtitle,
@@ -167,7 +329,7 @@ class DesktopUITests(unittest.TestCase):
         self.assertNotIn(self.library, self._paths())
         self.assertNotIn(self.input_audio, self._paths())
         self.assertIsNone(self.tool.tts)
-        self.assertEqual(self.app._sampling(), Sampling())
+        self.assertEqual(self.app._sampling(), Sampling(bright=True, compress=True, peak_guard=True))
         self.assertNotIn("speed_method", self.app.vars)
         self.assertEqual(float(self.app.srt_min_speed.get()), 1.0)
         self.assertEqual(str(self.app.history.cget("selectmode")), "extended")
@@ -177,7 +339,7 @@ class DesktopUITests(unittest.TestCase):
         self.assertEqual(float(self.app.video_end.get()), 10.0)
         self.assertEqual(float(self.app.video_speed.get()), 1.5)
         self.assertEqual(float(self.app.video_ramp.get()), 0.5)
-        self.assertTrue(self.app.video_keep_audio.get())
+        self.assertFalse(hasattr(self.app, "video_keep_audio"))
 
     def test_video_export_forwards_all_applied_segments_and_audio_without_loading_tts(self):
         source = self._load_video()
@@ -187,27 +349,18 @@ class DesktopUITests(unittest.TestCase):
         result = self.destination / "video_000000000006.mp4"
         with patch.object(self.tool, "edit_video_segments", return_value=(result, "Finished")) as render, \
              patch.object(self.app, "_job", side_effect=lambda function, *args: function()):
-            for keep_audio in (True, False):
-                self.app.video_keep_audio.set(keep_audio)
-                self.app.export_video()
-                self.assertEqual(render.call_args.args, (str(source), expected))
-                self.assertEqual(render.call_args.kwargs["keep_audio"], keep_audio)
-                self.assertEqual(render.call_args.kwargs["quality"], 20)
-                self.assertEqual(render.call_args.kwargs["preset"], "fast")
-                self.assertTrue(callable(render.call_args.kwargs["progress"]))
+            self.app.export_video()
+            self.assertEqual(render.call_args.args, (str(source), expected))
+            self.assertEqual(render.call_args.kwargs["keep_audio"], False)
+            self.assertEqual(render.call_args.kwargs["quality"], 20)
+            self.assertEqual(render.call_args.kwargs["preset"], "fast")
+            self.assertTrue(callable(render.call_args.kwargs["progress"]))
         self.assertIsNone(self.tool.tts)
 
-    def test_preview_sound_toggle_is_independent_of_export_sound(self):
-        toggle = next(widget for widget in self.app.video_play_button.master.winfo_children()
-                      if isinstance(widget, ttk.Checkbutton) and widget.cget("text") == "Âm thanh")
-        self.assertTrue(self.app.video_sound.get())
-        self.app.video_keep_audio.set(True)
-        toggle.invoke()
-        self.assertFalse(self.app.video_sound.get())
+    def test_video_preview_is_muted_without_sound_controls(self):
         self.app.video_preview.set_audio_enabled.assert_called_once_with(False)
-        self.assertTrue(self.app.video_keep_audio.get())
-        toggle.invoke()
-        self.app.video_preview.set_audio_enabled.assert_called_with(True)
+        self.assertFalse(hasattr(self.app, "video_sound"))
+        self.assertFalse(hasattr(self.app, "video_keep_audio"))
 
     def test_video_segment_form_rejects_non_numeric_fields_before_mutating_selection(self):
         self._load_video()
@@ -460,7 +613,7 @@ class DesktopUITests(unittest.TestCase):
     def test_busy_and_recording_block_destination_changes_and_deletion(self):
         self._select(self.speech)
         self.app.output_dir_var.set(str(self.folder / "not applied"))
-        for busy, recorder in ((True, None), (False, object())):
+        for busy, recorder in ((True, None),):
             with self.subTest(busy=busy, recorder=recorder is not None):
                 self.app.busy, self.app.recorder = busy, recorder
                 with patch("apps.v3turbo_desktop.messagebox.askyesno") as confirm:
@@ -526,8 +679,7 @@ class DesktopUITests(unittest.TestCase):
                         self.assertGreater(delete.winfo_height(), 5)
                         self.assertLessEqual(delete.winfo_rooty() + delete.winfo_height(),
                                              self.app.book.winfo_rooty() + self.app.book.winfo_height())
-            for title, action in (("Văn bản", "Tạo audio"), ("Hàng loạt", "Tạo batch và ZIP"),
-                                  ("Hội thoại", "Tạo hội thoại"), ("Video", "Xuất video")):
+            for title, action in (("Văn bản", "Chạy hàng đợi"), ("Video", "Xuất video")):
                 with self.subTest(size=(width, height), primary_action=action):
                     self.app.nav_buttons[title].invoke()
                     self._wait_for_page(title)

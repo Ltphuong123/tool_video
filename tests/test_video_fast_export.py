@@ -10,7 +10,7 @@ import numpy as np
 
 from apps.video_editor import SpeedSegment, _guard_reader_cleanup, build_multi_speed_time_map
 from apps.video_fast_export import (
-    _ENCODER_CACHE, _FFmpegFailure, _ffmpeg_binary, _time_expression, _video_filter,
+    _ENCODER_CACHE, _FFmpegFailure, _ffmpeg_binary, _simplify_knots, _time_expression, _video_filter,
     can_render_ffmpeg, get_video_encoding_options, render_video_ffmpeg,
     select_video_encoder,
 )
@@ -24,7 +24,7 @@ class NativeEncoderTests(unittest.TestCase):
     def tearDown(self):
         _ENCODER_CACHE.clear()
 
-    def test_native_path_accepts_constant_ranges_but_keeps_ramps_in_sampler(self):
+    def test_native_path_accepts_constant_ranges_and_smooth_ramps(self):
         self.assertTrue(can_render_ffmpeg(build_multi_speed_time_map(10, [])))
         self.assertTrue(can_render_ffmpeg(build_multi_speed_time_map(
             10, [SpeedSegment(2, 8, 1, 1)],
@@ -32,9 +32,21 @@ class NativeEncoderTests(unittest.TestCase):
         self.assertTrue(can_render_ffmpeg(build_multi_speed_time_map(
             10, [SpeedSegment(2, 8, 2, 0)],
         )))
-        self.assertFalse(can_render_ffmpeg(build_multi_speed_time_map(
+        self.assertTrue(can_render_ffmpeg(build_multi_speed_time_map(
             10, [SpeedSegment(2, 8, 2, 1)],
         )))
+
+    def test_ramp_simplification_bounds_error_across_long_source_timeline(self):
+        mapping = build_multi_speed_time_map(7200, [
+            SpeedSegment(100, 130, 4, 5), SpeedSegment(3600, 3650, 0.25, 10),
+        ])
+        for fps in (12, 30, 60):
+            source, output = _simplify_knots(mapping.source_knots, mapping.output_knots, 0.01 / fps)
+            errors = np.abs(np.interp(mapping.source_knots, source, output) - mapping.output_knots)
+            self.assertLessEqual(errors.max(), 0.01 / fps + 1e-10)
+            self.assertLess(len(source), len(mapping.source_knots) / 4)
+            self.assertEqual(source[0], 0)
+            self.assertEqual(output[-1], mapping.output_duration)
 
     def test_auto_uses_actual_encoder_probe_and_caches_failure(self):
         with patch("apps.video_fast_export._run_ffmpeg", side_effect=_FFmpegFailure("driver missing")) as run:
@@ -167,6 +179,19 @@ class NativeRenderTests(unittest.TestCase):
         self.assertEqual(updates[-1], 1)
         self.assertEqual(updates, sorted(updates))
         self.assertEqual(list(self.base.glob("*.fffilter")), [])
+
+    def test_native_smooth_ramps_keep_colors_duration_and_silent_output(self):
+        mapping = build_multi_speed_time_map(4, [
+            SpeedSegment(0.2, 1.8, 2, 0.4), SpeedSegment(2.2, 3.8, 0.5, 0.4),
+        ])
+        render_video_ffmpeg(self.colors, self.output, mapping, 20, encoder="libx264")
+        clip = self._open(self.output)
+        self.assertIsNone(clip.audio)
+        self.assertAlmostEqual(clip.duration, mapping.output_duration, delta=1 / 20)
+        for source_t, expected in ((0.5, [255, 0, 0]), (1.5, [0, 255, 0]),
+                                   (2.5, [0, 0, 255]), (3.5, [255, 255, 0])):
+            np.testing.assert_allclose(clip.get_frame(float(mapping.output_time(source_t)))[20, 20],
+                                       expected, atol=6)
 
     def test_fractional_frame_rate_and_video_only_export(self):
         source = self._open(self.fractional)

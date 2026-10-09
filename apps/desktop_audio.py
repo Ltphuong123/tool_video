@@ -230,9 +230,26 @@ class WavePlayer:
             self._buffers.clear()
             self._handle = None
 
-    def play_file(self, path):
+    def play_file(self, path, *, skip_initial_silence=False, on_start=None):
         try:
             with sf.SoundFile(path) as file:
+                if skip_initial_silence:
+                    # Search in bounded blocks, keeping a short pre-roll for the
+                    # first consonant. This changes playback only, never the file.
+                    start_frame = 0
+                    while True:
+                        self._check()
+                        offset = file.tell()
+                        block = file.read(file.samplerate * 5, dtype="float32", always_2d=True)
+                        if not len(block):
+                            raise ValueError("File audio không có tín hiệu nghe được.")
+                        active = np.flatnonzero(np.max(np.abs(block), axis=1) > 1e-4)
+                        if active.size:
+                            start_frame = max(0, offset + int(active[0]) - file.samplerate // 10)
+                            break
+                    file.seek(start_frame)
+                    if on_start:
+                        on_start(start_frame / file.samplerate)
                 while True:
                     self._check()
                     chunk = file.read(file.samplerate // 5, dtype="float32", always_2d=True)

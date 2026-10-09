@@ -9,20 +9,6 @@ from apps.srt_speech import Cue
 from apps.speech_speed import rubberband_to_samples
 
 
-def soften_srt_tail(audio, sample_rate=48000) -> np.ndarray:
-    """Fade the last 5 ms to silence without shifting the start or sample count."""
-    wav = np.asarray(audio, dtype=np.float32).copy()
-    if wav.ndim != 1 or not np.isfinite(wav).all():
-        raise ValueError("Audio phải là waveform mono hữu hạn.")
-    active = np.flatnonzero(np.abs(wav) > 1e-7)
-    if not active.size:
-        return wav
-    end = int(active[-1]) + 1
-    count = min(max(2, round(sample_rate * 0.005)), end)
-    if count > 1:
-        fade = (0.5 + 0.5 * np.cos(np.linspace(0, np.pi, count))).astype(np.float32)
-        wav[end - count:end] *= fade
-    return wav
 
 
 def cue_sample_windows(cues: list[Cue], sample_rate: int = 48000) -> list[tuple[int, int]]:

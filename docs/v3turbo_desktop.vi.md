@@ -34,23 +34,23 @@ uv sync --extra cuda --extra srt-quality --extra video --extra pdf --extra water
 
 ## Giao diện và điều hướng
 
-Thanh bên trái sắp xếp theo quy trình: **Đọc văn bản → Đọc phụ đề SRT → Chỉnh tốc độ video → Tạo hàng loạt → Hội thoại → Thư viện giọng → Lịch sử & file → Cấu hình → Fine-tune & API**. Tool mở ở trang Văn bản; thanh trên luôn hiển thị nơi lưu và nút đổi thư mục. Các trang cấu hình dài có thanh cuộn; bố cục cấu hình tự chuyển về một cột khi cửa sổ hẹp. Nút tạo audio được làm nổi bật, trạng thái model và tiến trình tách khỏi khu vực nhập nội dung.
+Thanh bên trái sắp xếp theo quy trình: **Đọc văn bản → Đọc phụ đề SRT → Chỉnh tốc độ video → Tạo hàng loạt → Hội thoại → Thư viện giọng → Lịch sử & file → Cấu hình → Fine-tune & API**. Tool mở ở trang Văn bản; thanh nơi lưu được ẩn ở Văn bản/SRT, có thể đổi thư mục tại Cấu hình. Các trang cấu hình dài có thanh cuộn; bố cục cấu hình tự chuyển về một cột khi cửa sổ hẹp. Nút tạo audio được làm nổi bật, trạng thái model và tiến trình tách khỏi khu vực nhập nội dung.
 
-1. **Cấu hình**: model/repo hoặc thư mục merge, auto/CPU/CUDA, ONNX/PyTorch, fp32/int8, dtype GPU, số luồng CPU, giới hạn streaming, thử lại câu ngắn. Chỉnh tốc độ đọc, temperature, top_k, top_p, phạt lặp/cửa sổ lặp, frame/đoạn, ký tự/đoạn và batch. Bật khử nhiễu, mã tham chiếu, watermark. Xuất WAV/FLAC/MP3; MP3 cần libsndfile có bộ mã hóa phù hợp.
-2. **Văn bản**: nhập văn bản hoặc TXT/Markdown/PDF, chọn giọng, clone trực tiếp bằng audio mẫu, tạo audio, audio + SRT từng câu hoặc streaming và nghe. Audio mẫu được ưu tiên hơn giọng chọn. PDF scan cần OCR trước.
-3. **Clone / Giọng**: chọn audio hoặc ghi micro, clone rồi lưu giọng, xóa giọng riêng, khử nhiễu, xuất embedding và codes thành NPZ, nhập/xuất thư viện JSON. Dùng clip sạch khoảng 3–8 giây, không cần lời thoại mẫu. Giọng có sẵn và bí danh được bảo vệ.
+1. **Cấu hình**: model/repo hoặc thư mục merge, auto/CPU/CUDA, ONNX/PyTorch, fp32/int8, dtype GPU, số luồng CPU, giới hạn streaming, thử lại câu ngắn. Chỉnh tốc độ đọc, temperature, top_k, top_p, phạt lặp/cửa sổ lặp, frame/đoạn, ký tự/đoạn và batch. Chọn EQ, compressor, giảm đỉnh; mã tham chiếu giữ đặc trưng giọng. Xuất WAV/FLAC/MP3; MP3 cần libsndfile có bộ mã hóa phù hợp.
+2. **Văn bản**: nhập văn bản hoặc TXT/Markdown/PDF, chọn giọng và tốc độ ngay trong tab, tạo audio, audio + SRT từng câu hoặc streaming và nghe. Thêm nhiều TXT hoặc nhiều văn bản vào hàng đợi; xem tiến trình và lịch sử trong tab. Dùng giọng clone đã lưu ở Thư viện giọng. PDF scan cần OCR trước.
+3. **Clone / Giọng**: chọn audio hoặc ghi micro, clone rồi lưu giọng, xóa giọng riêng, xuất embedding và codes thành NPZ, nhập/xuất thư viện JSON. Dùng clip sạch khoảng 3–8 giây, không cần lời thoại mẫu. Giọng có sẵn và bí danh được bảo vệ.
 4. **Hàng loạt**: mỗi dòng là một văn bản hoặc chọn nhiều file. Tạo ZIP gồm audio đánh số theo đúng thứ tự và manifest JSON. Kết quả lẻ cũng giữ trong thư mục xuất. Giọng chung áp dụng cho toàn bộ batch.
 5. **Hội thoại**: mỗi dòng `Nhân vật: lời thoại`, gán giọng cho từng nhân vật, đặt khoảng nghỉ giữa các lượt. Chọn giọng trước khi bấm tạo. Các lượt liên tiếp cùng giọng được tạo theo batch, tối đa **Số mục / batch**, để tận dụng GPU; thứ tự lượt và khoảng nghỉ được giữ nguyên.
-6. **SRT**: luôn đọc theo mốc bắt đầu tuyệt đối của phụ đề và giữ các khoảng trống. Tự tăng tốc từng câu khi cần vừa khung thời gian, không đẩy câu sau lùi đi. Có tốc độ ban đầu/tối thiểu riêng.
+6. **SRT**: thêm nhiều file vào hàng đợi, xem tiến trình từng file và lịch sử ngay trong tab; luôn đọc theo mốc bắt đầu tuyệt đối của phụ đề và giữ các khoảng trống. Tự tăng tốc từng câu khi cần vừa khung thời gian, không đẩy câu sau lùi đi. Có tốc độ ban đầu/tối thiểu riêng.
 7. **Fine-tune / API**: chạy lần lượt prepare/train/merge/đóng gói giọng bằng script sẵn có; hoặc chạy API streaming model gốc với CPU/CUDA, cổng và API key. API chỉ bind `127.0.0.1`. Giọng của desktop và giọng đăng ký trong API là hai thư viện riêng.
 8. **Lịch sử & file**: tự đọc lại file đã tạo khi mở tool, tìm theo tên/đường dẫn, lọc loại file, xem thời gian và dung lượng. Nghe audio, lưu bản sao, mở thư mục chứa file hoặc xóa nhiều file. Nhật ký hoạt động nằm ở thẻ riêng trong cùng trang.
-9. **Video**: xem video ngay trong giao diện, tua bằng thước thời gian, kéo chọn/di chuyển/đổi độ dài nhiều đoạn và chỉnh tốc độ riêng. MoviePy xuất video mới, giữ tiếng gốc đồng bộ bằng Rubber Band. Không cần tải model TTS.
+9. **Video**: xem, tua và chỉnh tốc độ video. Xem trước và xuất MP4 chỉ có hình, không có âm thanh. Không cần tải model TTS.
 
 ## Xem video và chỉnh tốc độ nhiều đoạn trên timeline
 
-Trong trang **Chỉnh tốc độ video**, bấm **Chọn…** để mở video ngay trong khung xem trước. Nếu nhập đường dẫn bằng tay, bấm **Mở video**. Nút **Phát / Tạm dừng** phát cả hình và tiếng theo các tốc độ đã áp dụng. Bật/tắt **Âm thanh** cạnh nút phát để nghe hoặc tắt tiếng xem trước; tùy chọn **Giữ âm thanh khi xuất** điều khiển riêng bản xuất. Đọc khung hình và xử lý âm thanh chạy trên luồng nền để giao diện vẫn phản hồi khi tua hoặc mở file.
+Trong trang **Chỉnh tốc độ video**, bấm **Chọn…** hoặc nhập đường dẫn rồi **Mở video**. **Phát / Tạm dừng** xem hình theo tốc độ đã áp dụng, không phát tiếng.
 
-Khi bật tiếng, hình đi theo vị trí thực tế của thiết bị phát âm thanh. Tua, đổi tốc độ hoặc tạm dừng sẽ dừng luồng tiếng cũ; phát tiếp bắt đầu từ vị trí hiện tại. Âm thanh dùng cùng đường thời gian và Rubber Band như bản xuất để giữ cao độ khi đổi tốc độ. Bộ đệm giới hạn theo các cửa sổ nhỏ, không cần xử lý xong toàn bộ video mới phát. Video không có track âm thanh vẫn xem bình thường.
+Xem trước chỉ giải mã khung hình; không khởi tạo bộ phát hay bộ xử lý âm thanh.
 
 Kéo trên thước thời gian để tua, hoặc dùng phím trái/phải khi timeline có focus để tua một giây. Kéo trên vùng trống của thanh bên dưới để chọn mốc bắt đầu/kết thúc, chọn tốc độ rồi bấm **Thêm đoạn**. Chọn một đoạn màu tím để chỉnh: kéo thanh tốc độ từ `0.25x` đến `4.0x`, kéo hai đầu để đổi độ dài, hoặc kéo thân đoạn để di chuyển. Có thể nhập số chính xác ở bảng bên phải rồi bấm **Áp dụng**. **Xóa đoạn / Xóa tất cả** bỏ các thay đổi tương ứng. Các đoạn không được chồng lên nhau; thao tác kéo được giới hạn bởi đoạn kề bên.
 
@@ -58,11 +58,11 @@ Mọi mốc tính theo **giây trong video gốc**, kể cả sau khi thay đổ
 
 Ví dụ thêm đoạn `30–45s` ở `1.5x` và đoạn `60–70s` ở `0.8x`. Mỗi đoạn có thời gian chuyển tốc độ riêng ở hai đầu; mặc định `0.5s`. Trong đoạn đầu, tốc độ tăng từ `1.0x` lên `1.5x`, giữ ở giữa, rồi giảm về `1.0x`. Chuyển `0s` để đổi ngay; thời gian chuyển tối đa nửa độ dài đoạn. Kéo thu ngắn đoạn sẽ tự giảm thời gian chuyển nếu cần. Đổi tốc độ sẽ thay đổi tổng thời lượng và vị trí của phần sau đoạn chỉnh.
 
-**Giữ âm thanh khi xuất** bật mặc định. Video và audio dùng chung một đường thời gian cho tất cả các đoạn; audio mono/stereo được xử lý bằng Rubber Band, với các cửa sổ nhỏ chồng lấn ở chỗ chuyển tốc độ. Cách này tránh trôi thời gian tích lũy và hạn chế đổi cao độ; cần nghe kiểm tra chất âm với nội dung thật, nhất là khi đổi tốc độ mạnh. Bỏ dấu chọn để xuất video không tiếng. Khi mọi đoạn là `1.0x`, phần audio bỏ qua Rubber Band.
+Bản xuất luôn không có track âm thanh. Tool bỏ qua đọc, chỉnh tốc độ, mã hóa và ghép âm thanh; thời gian tiết kiệm phụ thuộc video.
 
-Tool xuất MP4 H.264/AAC, giữ FPS danh nghĩa của nguồn. Mức chất lượng thấp hơn cho chất lượng cao hơn/file lớn hơn; mặc định `20` (CRF khi dùng CPU, CQ khi dùng NVIDIA). Hai bộ mã hóa không bảo đảm cùng chất lượng hoặc kích thước file ở cùng một giá trị. Preset `ultrafast/veryfast/faster/fast/medium` đi từ nhanh đến chậm; mặc định `fast`, chọn `veryfast` để ưu tiên tốc độ. Kích thước lẻ được đệm thêm tối đa một pixel để phù hợp H.264/yuv420p. Chức năng này chưa nội suy chuyển động, nên độ mượt khi làm chậm phụ thuộc FPS gốc. Track phụ đề trong video hoặc file SRT đi kèm chưa được tự chuyển mốc.
+Tool xuất MP4 H.264, giữ FPS danh nghĩa của nguồn. Mức chất lượng thấp hơn cho chất lượng cao hơn/file lớn hơn; mặc định `20` (CRF khi dùng CPU, CQ khi dùng NVIDIA). Hai bộ mã hóa không bảo đảm cùng chất lượng hoặc kích thước file ở cùng một giá trị. Preset `ultrafast/veryfast/faster/fast/medium` đi từ nhanh đến chậm; mặc định `fast`, chọn `veryfast` để ưu tiên tốc độ. Kích thước lẻ được đệm thêm tối đa một pixel để phù hợp H.264/yuv420p. Chức năng này chưa nội suy chuyển động, nên độ mượt khi làm chậm phụ thuộc FPS gốc. Track phụ đề trong video hoặc file SRT đi kèm chưa được tự chuyển mốc.
 
-Khi xuất, tool tự thử mã hóa một khung hình ở kích thước video bằng NVIDIA NVENC. Nếu GPU/bộ mã hóa không hỗ trợ, tool dùng CPU và cho bộ mã hóa tự tận dụng số luồng của máy. Căn theo hai file mốc và chỉnh đoạn với **Chuyển tốc độ = 0s** xử lý hình trực tiếp trong FFmpeg, tránh chuyển từng khung RGB qua Python. Các đoạn có chuyển tốc độ mượt vẫn dùng đường thời gian MoviePy và có thể mã hóa bằng GPU. Âm thanh đổi tốc độ được ghi thẳng sang AAC từ bộ đệm nhỏ; không ghi rồi đọc lại WAV trung gian. Thanh trạng thái báo giai đoạn âm thanh/video, phần trăm và thời gian đã chạy. Cần đóng và mở lại app bằng `run_v3turbo_desktop.bat` để dùng bộ xuất mới.
+Khi xuất, tool tự thử mã hóa một khung hình ở kích thước video bằng NVIDIA NVENC. Nếu GPU/bộ mã hóa không hỗ trợ, tool dùng CPU và cho bộ mã hóa tự tận dụng số luồng của máy. Cả căn mốc, đổi tốc độ ngay và chuyển tốc độ mượt đều xử lý hình trực tiếp trong FFmpeg, tránh chuyển từng khung RGB qua Python. Đường cong tốc độ được rút gọn với sai số thời gian tối đa 0,01 khung hình; giữ nguyên mốc đầu/cuối và tổng thời lượng dự kiến. Mức chất lượng, FPS và kích thước xuất giữ theo cấu hình. Thanh trạng thái báo giai đoạn mã hóa video, phần trăm và thời gian đã chạy. Cần đóng và mở lại app bằng `run_v3turbo_desktop.bat` để dùng bộ xuất mới.
 
 File `video_<mã>.mp4` lưu trong thư mục đang chọn, xuất hiện trong **Lịch sử & file → Video**. **Mở / nghe** mở video bằng trình phát mặc định; có thể lưu bản sao hoặc xóa như các file khác. Nút **Dừng tác vụ / phát** hủy lượt xuất và dọn file dở. Giới hạn bộ nhớ theo các cửa sổ audio và khung hình, không nạp toàn bộ video vào RAM.
 
@@ -183,3 +183,93 @@ Test dùng model giả để kiểm tra thứ tự batch, lưu WAV, streaming, d
 Test lưu trữ và giao diện kiểm tra nhớ nơi lưu sau khi mở lại, lịch sử nhiều thư mục, lọc/tìm kiếm, xóa nhiều file và audio + SRT, hủy thao tác xóa, bảo vệ thư viện giọng và chặn thao tác khi đang chạy. Bố cục được kiểm tra ở kích thước `980×620` và `1280×850` bằng cửa sổ thử nghiệm ẩn. Test video kiểm tra kéo chọn/di chuyển/thu ngắn đoạn, giữ chính xác các mốc liền kề, thay tốc độ qua slider và nhập số, kế hoạch xuất nhiều đoạn, đồng bộ âm thanh và hình. Test preview kiểm tra tua gộp, loại kết quả của file cũ, đóng reader và phát/tua một video mẫu thật trong khung Tkinter.
 
 Benchmark đọc/ghi và điều phối streaming, dùng model giả và thay time-stretch bằng phép lấy mẫu đơn giản để tách chi phí này khỏi suy luận/DSP: median 5 lượt với nguồn 20/60/600 giây lần lượt giảm từ 33.87/105.42/784.89 ms xuống 19.82/61.73/411.20 ms trên máy phát triển. Đây là cải thiện khoảng 41–48% của phần đọc/ghi và điều phối, chưa phải mức tăng tốc tạo giọng của model. Script và số liệu nằm trong `outputs/audio_benchmark/` ở máy phát triển. Hội thoại nhiều câu liên tiếp cùng giọng có thể tận dụng batching CUDA; mức tăng tốc thực tế phụ thuộc phần cứng và nội dung, CPU vẫn có thể suy luận tuần tự.
+
+## Hàm tạo giọng dùng chung
+
+Phần tổng hợp trong `apps/v3turbo_tool.py` gọi `generate_speech()` từ `apps/simple_tts_engine.py` cho Tạo audio, Audio + SRT, batch, hội thoại và đọc SRT. Hàm nhận model đang tải, tham số sampling/watermark và giọng hoặc audio tham chiếu; trả audio trong RAM bằng `save=False`. Các nhóm câu vẫn dùng `infer_batch` để giữ hiệu suất batch của SDK.
+
+Tool desktop tiếp tục phụ trách xuất WAV/FLAC/MP3, lịch sử file, dừng tác vụ, Rubber Band và căn mốc SRT. Không ghi WAV trung gian hoặc nạp thêm model. Streaming tiếp tục dùng `infer_stream` để phát các chunk ngay khi có dữ liệu. Các hiệu ứng tùy chọn trong simple_tts không tự bật cho desktop.
+
+## Hàng đợi trong tab Văn bản và SRT
+
+Tab **Văn bản** có tốc độ đọc ngay trong tab (dùng chung giá trị với Cấu hình), không còn audio tham chiếu trực tiếp. Muốn dùng giọng clone, tạo/lưu giọng trong **Clone / Giọng**, rồi chọn giọng đó.
+
+- **Thêm nhiều TXT**: chọn nhiều file để thêm vào hàng đợi.
+- **Thêm nội dung vào hàng đợi**: mỗi lần thêm giữ toàn bộ nội dung thành một mục.
+- **Tách nhiều văn bản (===)**: phân cách các văn bản bằng một dòng chỉ có `===`; các đoạn trống trong cùng văn bản vẫn được giữ.
+- Bấm **Chạy hàng đợi**: chốt giọng, tốc độ, định dạng và chạy từng mục một.
+
+Tab **SRT** chọn nhiều file bằng **Thêm nhiều file SRT**. Mỗi file tạo một audio riêng, giữ mốc bắt đầu/khoảng lặng và tốc độ ban đầu đã chọn.
+
+Mỗi mục có trạng thái và thanh tiến trình riêng. Audio văn bản dùng thanh chuyển động khi SDK suy luận vì chưa có phần trăm nội bộ; hoàn thành hiển thị 100%. SRT hiển thị tiến trình theo số câu hoàn thành. Mục lỗi không chặn các mục tiếp theo; chạy lại hàng đợi sẽ thử các mục lỗi/đã dừng và các mục còn chờ, bỏ qua mục đã xong. Có thể chọn và xóa mục khỏi hàng đợi khi không chạy.
+
+**Dừng** yêu cầu dừng mục đang chạy và không bắt đầu mục tiếp theo; SDK có thể cần hoàn tất lượt suy luận hiện tại. Hàng đợi thuộc phiên hiện tại, không tự lưu khi đóng tool.
+
+Hai tab có **Lịch sử tạo** riêng, tự cập nhật và nạp lại các file đã xuất khi mở tool. Có thể nghe/mở file hoặc thư mục ngay tại đây. Kết quả không tự chuyển sang tab Lịch sử chung. Thanh nơi lưu được ẩn trên hai tab; nơi lưu chung vẫn được chỉnh ở **Cấu hình**. Xóa file vẫn ở **Lịch sử & file**.
+
+## Các xử lý âm thanh được giữ lại
+
+Desktop và simple_tts chỉ dùng Rubber Band để đổi tốc độ, EQ sáng nhẹ, compressor và giảm đỉnh âm lượng. Desktop bật/tắt ba hiệu ứng ở **Cấu hình**, áp dụng cho văn bản, hàng đợi, Audio + SRT, hội thoại và SRT. Streaming có hiệu ứng sẽ chờ tổng hợp xong rồi xử lý một lần và phát đúng bản được xuất.
+
+Đã bỏ tính năng khử nhiễu, watermark và fade cuối câu trong tool. Clone và xuất reference luôn dùng audio mẫu không khử nhiễu; các tham số False được truyền rõ để SDK không tự bật xử lý mặc định. Dữ liệu embedding/reference codes là phần của mô hình để nhận diện giọng, không phải hiệu ứng hậu xử lý.
+
+Mặc định các hiệu ứng tắt. Khi tắt, tool không dựng chuỗi Pedalboard và không sao chép audio cho hậu xử lý; tốc độ 1.0x bỏ qua Rubber Band. Các hiệu ứng EQ/compressor được gộp thành một chuỗi. Căn mốc SRT, bỏ padding im lặng và chèn khoảng trống vẫn giữ để lời đọc khớp phụ đề. Không thay đổi tham số tổng hợp để đánh đổi chất lượng lấy tốc độ; chưa đo hiệu suất model thật.
+
+## Giao diện rút gọn và tạo theo nhóm
+
+Tool hiện có đúng năm tab: **Văn bản**, **SRT**, **Video**, **Lịch sử & file**, **Cấu hình**. Đã bỏ tab Hàng loạt/ZIP, Hội thoại, Thư viện giọng và Fine-tune/API, cùng các hàm quản lý riêng của chúng. Các file đã tạo và giọng đã lưu trước đây không bị xóa; giọng đã lưu vẫn được nạp khi tải model.
+
+Hàng đợi văn bản và SRT vẫn nằm ngay trong hai tab. Hàng đợi văn bản gom các mục hợp lệ theo **Số mục / batch** và gọi `infer_batch`, xuất từng file audio riêng, không tạo ZIP. Trên GPU có thể tận dụng xử lý batch; CPU/ONNX vẫn xử lý tuần tự trong engine. Một lỗi suy luận của nhóm làm nhóm đó báo lỗi; có thể thử lại. Các file TXT lỗi/trống được báo riêng trước khi tổng hợp và không chặn các mục hợp lệ.
+
+Model được dùng lại khi bấm Tải model với cùng cấu hình; đổi cấu hình sẽ tải lại. Giải phóng model rồi tải lại nếu cần đọc lại trọng số/giọng đã thay đổi trên đĩa. Danh sách giọng chỉ được cập nhật khi model thay đổi. Các sự kiện kết quả hàng đợi được gộp để tránh quét lịch sử nhiều lần trong cùng lượt cập nhật giao diện.
+
+Các tối ưu giữ chất lượng FP32, tham số sampling và Rubber Band chất lượng cao; không tuyên bố mức tăng tốc khi chưa đo trên model thật.
+
+## Tối ưu Audio + SRT theo cách tạo từng câu
+
+Vẫn tạo từng câu theo batch, không dùng Stable-ts hoặc mô hình căn chỉnh bổ sung. Rubber Band chỉ chạy một lần trên mỗi câu khi tốc độ khác 1.0x. Sau khi ghép các câu và lấy mốc phụ đề, EQ/compressor/giảm đỉnh chỉ chạy một lần trên toàn track; giảm việc khởi tạo hiệu ứng và tránh nén/giảm gain riêng từng câu. Các hiệu ứng này không đổi số mẫu audio.
+
+Trên CUDA, thử Số mục / batch từ 8 lên 16 nếu đủ bộ nhớ; không bảo đảm luôn nhanh hơn, cần đo trên máy. Trên CPU/ONNX, tăng batch không làm các câu chạy song song. Giữ tốc độ 1.0x và tắt hiệu ứng không cần dùng để giảm hậu xử lý. Chất lượng mô hình và chế độ Rubber Band vẫn được giữ; chưa đo mức tăng tốc với model thật.
+
+## Mặc định Cấu hình
+
+EQ, compressor và giảm đỉnh -1 dBFS mặc định bật khi mở desktop, có thể bỏ chọn. Ô Dùng mã audio tham chiếu đã bỏ khỏi giao diện; model vẫn dùng mã giọng theo mặc định.
+
+## Tab Văn bản: hàng đợi audio + SRT
+
+Tab Văn bản có hai cột: nội dung/giọng/tốc độ bên trái, **Hàng đợi** và **Lịch sử tạo** bên phải. Chỉ giữ **Thêm văn bản**, **Thêm TXT** và các nút quản lý hàng đợi. Mỗi lần thêm văn bản là một mục; nội dung không tự tách bằng dòng ===.
+
+Bấm **Chạy hàng đợi** luôn xuất audio và SRT từng câu cho mỗi mục, kể cả file TXT. Các mục chạy lần lượt; câu trong mỗi mục vẫn được tổng hợp theo batch, hiệu ứng chạy một lần sau khi ghép. Thanh tiến trình hiển thị số câu hoàn thành của mục đang chạy.
+
+Trong **Lịch sử tạo**, chọn file rồi bấm **Phát** hoặc nhấp đúp để nghe ngay bằng trình phát nội bộ của tool; bấm **Dừng** để dừng. **Xóa** yêu cầu xác nhận và xóa audio cùng SRT đi kèm, cập nhật cả lịch sử trong tab và lịch sử chung. Không thể xóa khi đang tạo/phát. Nút **Thư mục** vẫn mở nơi chứa file.
+
+Bố cục tương tự cho phần hàng đợi/lịch sử của tab SRT. Các nút nhập TXT/PDF đơn, tạo audio riêng, streaming và tách nhiều văn bản đã được bỏ khỏi tab Văn bản.
+
+## Nghe thử SRT có mốc bắt đầu muộn
+
+Audio SRT vẫn giữ timeline tuyệt đối, bao gồm khoảng lặng dài trước câu đầu. Nút Phát trong lịch sử SRT/lịch sử chung tự tìm phần có tín hiệu và nghe từ trước đó 100 ms; không sửa file, không dời mốc xuất, không bỏ khoảng lặng giữa các câu. Trạng thái hiển thị mốc bắt đầu phát. Nếu không có tín hiệu trên toàn file, trình phát báo lỗi; luồng tạo SRT cũng chặn xuất track toàn im lặng.
+
+## Đo thời gian Audio + SRT
+
+Log của mỗi mục văn bản ghi tổng thời gian, thời gian model và thời gian hậu xử lý/xuất file. So sánh sau khi model đã tải và chạy thử một lượt, vì lần đầu có chi phí khởi tạo.
+
+Trên PyTorch/CUDA, tool gom cửa sổ tối đa 4 × batch (không quá 128 câu) rồi để SDK sắp theo độ dài và xử lý từng batch. Giới hạn batch GPU vẫn đúng giá trị Cấu hình; không tăng số câu đồng thời trên GPU. CPU/ONNX giữ nhóm cũ và chạy tuần tự. Cách này giảm số lần gọi và cho SDK nhiều câu để ghép theo độ dài, nhưng chưa có số đo tăng tốc trên model thật.
+
+## Tối ưu đọc file SRT
+
+PyTorch/CUDA dùng cửa sổ câu lớn hơn để SDK sắp theo độ dài trước khi batch; giới hạn batch GPU vẫn giữ như cấu hình. ONNX/CPU giữ nhóm cũ. Chuỗi EQ/compressor dựng một lần cho mỗi file SRT rồi dùng lại, luôn reset trước mỗi câu để không mang trạng thái âm thanh sang câu tiếp theo. Rubber Band vẫn chỉ chạy khi cần chỉnh thời lượng và luôn giữ chất lượng cao; khoảng lặng/timeline không được đưa qua EQ.
+
+Log mỗi file SRT ghi Total, model, tempo/effects và export để biết phần nào chậm. Đây là tối ưu giảm xử lý thừa; chưa đo mức tăng tốc với model thật. Tốc độ ban đầu SRT 1.0x sẽ bỏ qua Rubber Band với những câu vốn vừa khung; câu dài vẫn được tự tăng tốc.
+
+## Thư viện mở video
+
+File `run_v3turbo_desktop.bat` kiểm tra MoviePy 2.2+, Pillow và FFmpeg qua imageio-ffmpeg trước khi mở ứng dụng. Nếu thiếu, launcher dùng uv pip để cài bổ sung MoviePy vào chính .venv hiện có, không uv sync toàn bộ môi trường và không gỡ cấu hình CUDA. Lần cài bổ sung cần Internet. Nếu không cài được, tool vẫn khởi chạy để dùng các chức năng khác; lỗi thư viện video được báo khi mở video.
+
+Có thể cài thủ công:
+```powershell
+uv pip install --python .venv/Scripts/python.exe "moviepy>=2.2,<3"
+```
+
+### Tốc độ xuất video
+
+Trên trích đoạn 12 giây, 960×720, CPU libx264, preset fast và chất lượng 20: đường MoviePy cũ 2,55 giây, FFmpeg trực tiếp 1,73 giây. Đây là phép đo mẫu; không bảo đảm cùng mức tăng cho video khác hay toàn bộ file. Chọn preset **veryfast** để giảm chi phí mã hóa CPU; file có thể lớn hơn. Video vẫn phải mã hóa lại khi đổi tốc độ.

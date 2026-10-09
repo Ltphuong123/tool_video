@@ -1,8 +1,7 @@
-"""Native FFmpeg video retiming, without transferring RGB frames through Python.
+"""Native FFmpeg video retiming, including smooth speed ramps.
 
-The audio track is prepared separately by the shared pitch-preserving renderer.
-Only maps with constant speed between anchors use this path; smooth speed ramps
-keep the existing MoviePy frame sampler.
+Maps are evaluated inside FFmpeg without RGB frame transfer through Python.
+Dense ramp knots are simplified with a bounded error of 0.01 output frame.
 """
 from __future__ import annotations
 
@@ -43,11 +42,10 @@ def _ffmpeg_binary() -> str:
 
 
 def can_render_ffmpeg(mapping) -> bool:
-    """Whether a shared map has no smooth transition requiring frame sampling."""
-    segments = getattr(mapping, "segments", None)
-    if segments is None:
-        return False
-    return all(segment.ramp_seconds == 0 or segment.speed == 1 for segment in segments)
+    """Accept the monotone source/output maps shared by all desktop editors."""
+    return (getattr(mapping, "segments", None) is not None and
+            getattr(mapping, "source_knots", None) is not None and
+            getattr(mapping, "output_knots", None) is not None)
 
 
 def _mapping_knots(mapping) -> tuple[np.ndarray, np.ndarray]:
@@ -61,6 +59,32 @@ def _mapping_knots(mapping) -> tuple[np.ndarray, np.ndarray]:
                              rel_tol=0, abs_tol=1e-8)):
         raise ValueError("Đường thời gian video không hợp lệ để xuất bằng FFmpeg.")
     return source, output
+
+
+def _simplify_knots(source: np.ndarray, output: np.ndarray,
+                    tolerance: float) -> tuple[np.ndarray, np.ndarray]:
+    """Keep endpoints and split wherever linear output-time error is too large.
+
+    Error is tested at all original knots, bounding it across the entire
+    piecewise-linear map. Iteration avoids recursion depth on long timelines.
+    """
+    keep = {0, len(source) - 1}
+    pending = [(0, len(source) - 1)]
+    while pending:
+        begin, end = pending.pop()
+        if end - begin <= 1:
+            continue
+        inner = source[begin + 1:end]
+        slope = (output[end] - output[begin]) / (source[end] - source[begin])
+        errors = np.abs(output[begin + 1:end] -
+                        (output[begin] + (inner - source[begin]) * slope))
+        index = int(np.argmax(errors))
+        if errors[index] > tolerance:
+            middle = begin + index + 1
+            keep.add(middle)
+            pending.extend(((begin, middle), (middle, end)))
+    indices = sorted(keep)
+    return source[indices], output[indices]
 
 
 def _time_expression(source: np.ndarray, output: np.ndarray) -> str:
@@ -82,6 +106,7 @@ def _time_expression(source: np.ndarray, output: np.ndarray) -> str:
 
 def _video_filter(mapping, fps: float) -> str:
     source, output = _mapping_knots(mapping)
+    source, output = _simplify_knots(source, output, 0.01 / fps)
     rate = Fraction(float(fps)).limit_denominator(1_000_000)
     rate_text = f"{rate.numerator}/{rate.denominator}"
     duration = format(float(output[-1]), ".17g")
@@ -261,7 +286,7 @@ def render_video_ffmpeg(source, destination, mapping, fps: float,
                         check_stop: Callable = lambda: None,
                         progress: Callable = lambda fraction: None,
                         encoder: str = "auto", size=None) -> str:
-    """Render constant-speed intervals natively; return the selected codec.
+    """Render constant intervals and smooth ramps natively; return the codec.
 
     ``audio_path`` is an already retimed AAC file and is copied without another
     encode. The destination must not exist and is removed on failure or cancel.
@@ -279,7 +304,7 @@ def render_video_ffmpeg(source, destination, mapping, fps: float,
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("FPS video phải là một số hữu hạn lớn hơn 0.")
     if not can_render_ffmpeg(mapping):
-        raise ValueError("Đường thời gian có chuyển tốc độ mượt cần bộ xuất MoviePy.")
+        raise ValueError("Unsupported video timeline mapping.")
     video_filter = _video_filter(mapping, fps)
     if audio_path is not None:
         audio_path = Path(audio_path).expanduser().resolve()

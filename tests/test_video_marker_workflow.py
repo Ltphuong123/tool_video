@@ -1,7 +1,6 @@
 """Marker file editing workflows without model, decoder or audio devices."""
 from __future__ import annotations
 
-import atexit
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -206,9 +205,7 @@ class MarkerDesktopWorkflowTests(unittest.TestCase):
             for identifier in self.root.tk.call("after", "info"):
                 self.root.after_cancel(identifier)
             self.app.busy = False
-            self.app.recorder = None
             self.app.close()
-            atexit.unregister(self.app._terminate_children)
         if hasattr(self, "temp"):
             self.temp.cleanup()
 
@@ -287,14 +284,12 @@ class MarkerDesktopWorkflowTests(unittest.TestCase):
         with patch.object(self.tool, "edit_video_markers", return_value=(result, "Aligned")) as aligned, \
              patch.object(self.tool, "edit_video_segments") as manual, \
              patch.object(self.app, "_job", side_effect=lambda function, *args: function()):
-            for keep_audio in (True, False):
-                self.app.video_keep_audio.set(keep_audio)
-                self.app.export_video()
-                self.assertEqual(aligned.call_args.args, (str(source), OLD_MARKERS, NEW_MARKERS))
-                self.assertEqual(aligned.call_args.kwargs["keep_audio"], keep_audio)
-                self.assertEqual(aligned.call_args.kwargs["quality"], 20)
-                self.assertEqual(aligned.call_args.kwargs["preset"], "fast")
-                self.assertTrue(callable(aligned.call_args.kwargs["progress"]))
+            self.app.export_video()
+            self.assertEqual(aligned.call_args.args, (str(source), OLD_MARKERS, NEW_MARKERS))
+            self.assertEqual(aligned.call_args.kwargs["keep_audio"], False)
+            self.assertEqual(aligned.call_args.kwargs["quality"], 20)
+            self.assertEqual(aligned.call_args.kwargs["preset"], "fast")
+            self.assertTrue(callable(aligned.call_args.kwargs["progress"]))
         manual.assert_not_called()
         self.assertIsNone(self.tool.tts)
 
