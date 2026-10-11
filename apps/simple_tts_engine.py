@@ -43,7 +43,7 @@ def generate_speech(text, voice=None, output_dir=None, *, options=None, model=No
         options.validate()
     kwargs = {"apply_watermark": False, **(inference_kwargs or {})}
     if kwargs.get("apply_watermark") or kwargs.get("denoise"):
-        raise ValueError("Only Rubber Band, EQ, compressor and peak control are supported.")
+        raise ValueError("Only Rubber Band tempo adjustment is supported.")
     kwargs["denoise"] = False
     if "voice" in kwargs or "ref_audio" in kwargs:
         raise ValueError("Truyền voice/ref_audio qua tham số riêng.")

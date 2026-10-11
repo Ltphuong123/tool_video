@@ -104,16 +104,17 @@ class BackendTests(unittest.TestCase):
         self.service.factory = factory
         self.assertEqual(len(self.service.load()), 1)
 
-    def test_function_returns_audio_and_applies_effects(self):
+    def test_function_returns_audio_without_reducing_peaks(self):
         model = FakeModel()
         model.audio *= 20
         result = generate_speech("hello", "turbo_voice", self.temp.name, model=model,
-                                 options=AudioOptions(peak_guard=True))
+                                 options=AudioOptions())
         self.assertTrue(result.path.is_file())
         self.assertEqual(result.sample_rate, 48000)
         audio, rate = sf.read(result.path, dtype="float32")
         np.testing.assert_array_equal(audio, result.audio)
-        self.assertLessEqual(float(audio.max()), 10**(-1/20) + 1e-6)
+        np.testing.assert_array_equal(result.audio, model.audio)
+        self.assertEqual(float(audio.max()), 2)
         self.assertEqual(float(model.audio.max()), 2)
         self.assertFalse(model.closed)
 

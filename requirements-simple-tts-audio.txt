@@ -1,2 +1,2 @@
-# Rubber Band, EQ and Compressor for simple_tts
+# Rubber Band tempo adjustment for simple_tts
 pedalboard>=0.9.26,<0.10

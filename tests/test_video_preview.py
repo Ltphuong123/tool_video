@@ -12,7 +12,43 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from apps.video_editor import SpeedSegment, build_multi_speed_time_map
-from apps.video_preview import VideoPreview, _PreviewDecoder
+from apps.video_preview import VideoPreview, _PreviewDecoder, _open_clip
+
+
+@unittest.skipUnless(importlib.util.find_spec("moviepy"), "optional MoviePy not installed")
+class VariableRatePreviewTests(unittest.TestCase):
+    def test_retimed_picture_follows_timestamp_during_playback_and_random_seeks(self):
+        from moviepy import VideoClip
+        from apps.video_editor import render_marker_alignment
+        from apps.video_markers import TimeMarker
+
+        colors = ((230, 20, 20), (20, 230, 20), (20, 20, 230))
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = (Path(folder) / name for name in ('source.mp4', 'retimed.mp4'))
+            clip = VideoClip(lambda t: np.full((36, 64, 3), colors[min(2, int(t))], dtype=np.uint8),
+                             duration=3).with_fps(10)
+            try:
+                clip.write_videofile(str(source), codec='libx264', audio=False,
+                                     preset='ultrafast', threads=1, logger=None)
+            finally:
+                clip.close()
+            old = tuple(TimeMarker(i + 1, stamp) for i, stamp in enumerate((0, 1000, 2000)))
+            new = tuple(TimeMarker(i + 1, stamp) for i, stamp in enumerate((0, 3000, 3500)))
+            render_marker_alignment(source, output, old, new, keep_audio=False, export_mode='copy')
+            reader = _open_clip(output)
+            try:
+                self.assertLessEqual(reader.fps, 30)
+                for seconds, channel in ((.2, 0), (2.5, 0), (3.2, 1), (4.2, 2),
+                                         (1.5, 0), (3.8, 2), (0, 0), (4.4, 2)):
+                    frame = reader.get_frame(seconds)
+                    self.assertEqual(int(np.argmax(frame.mean(axis=(0, 1)))), channel,
+                                     f'Wrong picture at {seconds}s')
+                process = reader.proc
+            finally:
+                reader.close()
+            self.assertTrue(process.stdout.closed)
+            self.assertTrue(process.stderr.closed)
+            output.rename(Path(folder) / 'released.mp4')
 
 
 class FakeClip:

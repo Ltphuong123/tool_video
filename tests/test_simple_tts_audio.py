@@ -47,25 +47,12 @@ class AudioTests(unittest.TestCase):
             self.assertTrue(np.isfinite(wav).all())
 
 
-    def test_reused_effects_reset_to_match_independent_cues(self):
-        from apps.simple_tts_audio import build_effect_chain
-        options = AudioOptions(bright=True, compress=True, peak_guard=True)
-        chain = build_effect_chain(options)
-        for scale in [1, 2, .5, 1]:
-            wav = self.audio * scale
-            expected, _ = process_audio(wav, self.rate, options)
-            actual, _ = process_audio(wav, self.rate, options, effects_chain=chain)
-            np.testing.assert_array_equal(actual, expected)
-
-    def test_eq_compressor_and_guard_real(self):
-        for bright, compress in [(True, False), (False, True), (True, True)]:
-            wav, rate = process_audio(self.audio, self.rate, AudioOptions(bright=bright, compress=compress))
-            self.assertEqual(len(wav), len(self.audio))
-            self.assertTrue(np.isfinite(wav).all())
+    def test_bypass_keeps_amplitude_including_peaks_above_one(self):
         loud = self.audio * 10
-        wav, _ = process_audio(loud, self.rate, AudioOptions(peak_guard=True))
-        self.assertLessEqual(float(np.max(np.abs(wav))), 10**(-1/20) + 1e-6)
-        np.testing.assert_allclose(wav / loud.max(), loud / loud.max() * (10**(-1/20) / loud.max()), atol=1e-6)
+        wav, rate = process_audio(loud, self.rate, AudioOptions())
+        np.testing.assert_array_equal(wav, loud)
+        self.assertEqual(rate, self.rate)
+        self.assertGreater(float(np.max(np.abs(wav))), 1)
 
     def test_float_export_does_not_clip_unprotected_peaks(self):
         path = save_variant(self.source, self.folder, AudioOptions(), self.audio * 10, self.rate)
@@ -83,15 +70,14 @@ class AudioTests(unittest.TestCase):
             process_audio(self.audio, self.rate, AudioOptions(tempo="rubberband", speed=1))
         self.assertTrue(np.shares_memory(audio, self.audio))
 
-    def test_processing_preserves_source_for_all_effects(self):
+    def test_tempo_processing_preserves_source(self):
         original = self.audio.copy()
-        for options in [AudioOptions(tempo="rubberband", speed=1.2),
-                        AudioOptions(bright=True, compress=True, peak_guard=True)]:
+        for options in [AudioOptions(tempo="rubberband", speed=1.2), AudioOptions()]:
             process_audio(self.audio, self.rate, options)
             np.testing.assert_array_equal(self.audio, original)
         loud = self.audio * 10
         original_loud = loud.copy()
-        process_audio(loud, self.rate, AudioOptions(peak_guard=True))
+        process_audio(loud, self.rate, AudioOptions())
         np.testing.assert_array_equal(loud, original_loud)
 
     def test_generated_source_cached_without_disk_read_or_new_inference(self):
@@ -101,7 +87,7 @@ class AudioTests(unittest.TestCase):
         source = service.generate("hello")
         with patch("apps.simple_tts.sf.read", side_effect=AssertionError("unneeded disk read")):
             for _ in range(2):
-                service.variant(source, AudioOptions(peak_guard=True))
+                service.variant(source, AudioOptions(tempo="rubberband", speed=1.2))
         self.assertEqual(len(model.calls), 1)
 
     def test_external_source_cache_reloads_on_file_change(self):
@@ -110,7 +96,7 @@ class AudioTests(unittest.TestCase):
         read = sf.read
         with patch("apps.simple_tts.sf.read", wraps=read) as reader:
             service.variant(self.source, AudioOptions())
-            service.variant(self.source, AudioOptions(bright=True))
+            service.variant(self.source, AudioOptions(tempo="rubberband", speed=1.2))
             self.assertEqual(reader.call_count, 1)
             sf.write(self.source, self.audio[:1000], self.rate, subtype="FLOAT")
             result = service.variant(self.source, AudioOptions())

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import textwrap
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
@@ -86,6 +87,33 @@ def parse_srt(text: str, *, strict_timing: bool = False) -> list[Cue]:
     for i, c in enumerate(cues):
         c.index = i + 1
     return cues
+
+
+def wrap_srt_text(text: str, width: int = 70) -> str:
+    """Wrap dialogue without changing source cue indices or timestamp lines."""
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').lstrip('\ufeff').split('\n')
+    output, body = [], []
+
+    def timeline(line):
+        if '-->' not in line:
+            return False
+        before, after = line.split('-->', 1)
+        return bool(_TIME.search(before) and _TIME.search(after))
+
+    def flush():
+        if body:
+            output.extend(textwrap.wrap(' '.join(body), width=width, break_on_hyphens=False))
+            body.clear()
+
+    for position, line in enumerate(lines):
+        index_line = line.strip().isdigit() and position + 1 < len(lines) and timeline(lines[position + 1])
+        if not line.strip() or timeline(line) or index_line:
+            flush()
+            output.append(line)
+        else:
+            body.append(line.strip())
+    flush()
+    return '\n'.join(output).rstrip('\n') + '\n'
 
 
 def _to_mono_f32(w) -> np.ndarray:

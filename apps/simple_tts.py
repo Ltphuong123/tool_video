@@ -162,9 +162,6 @@ class SimpleTTSApp:
         self.tabs.add(settings_page, text="2. Thử công nghệ")
         self.tempo_name = tk.StringVar(value=next(iter(TEMPO)))
         self.speed = tk.StringVar(value="1.0")
-        self.bright = tk.BooleanVar(value=False)
-        self.compress = tk.BooleanVar(value=False)
-        self.peak_guard = tk.BooleanVar(value=False)
         ttk.Label(settings, text="Đổi tốc độ", style="Simple.TLabel").pack(anchor="w")
         box = ttk.Combobox(settings, textvariable=self.tempo_name, values=list(TEMPO), state="readonly")
         box.pack(fill="x", pady=(4, 12))
@@ -175,15 +172,8 @@ class SimpleTTSApp:
         speed_box = ttk.Spinbox(row, textvariable=self.speed, from_=0.5, to=2.0, increment=0.05, width=8)
         speed_box.pack(side="left", padx=12)
         self.extra_controls.append((speed_box, "normal"))
-        for label, var in [("EQ: giọng sáng nhẹ", self.bright),
-                           ("Compressor: âm lượng đều hơn", self.compress),
-                           ("Giảm đỉnh vượt -1 dBFS (chỉ giảm âm lượng)", self.peak_guard)]:
-            box = ttk.Checkbutton(settings, text=label, variable=var)
-            box.pack(anchor="w", pady=3)
-            self.extra_controls.append((box, "normal"))
         ttk.Label(settings, text="Tạo bản gốc một lần, đổi thiết lập rồi bấm Thử trên bản gốc.\n"
-                  "Mỗi lần thử lưu WAV + JSON riêng, không tạo lại lời đọc.\n"
-                  "EQ/giảm đỉnh không phục hồi tiếng vỡ đã có trong âm gốc.",
+                  "Mỗi lần thử lưu WAV + JSON riêng, không tạo lại lời đọc.",
                   style="Simple.TLabel", wraplength=750).pack(anchor="w", pady=12)
         self.text = tk.Text(editor, wrap="word", font=("Segoe UI", 12), height=8,
                             undo=True, relief="flat", background="#f8faff", padx=12, pady=12,
@@ -328,8 +318,7 @@ class SimpleTTSApp:
 
     def options(self):
         return AudioOptions(
-            tempo=TEMPO[self.tempo_name.get()], speed=float(self.speed.get()),
-            bright=self.bright.get(), compress=self.compress.get(), peak_guard=self.peak_guard.get())
+            tempo=TEMPO[self.tempo_name.get()], speed=float(self.speed.get()))
 
     def add_result(self, path, label):
         self.last_audio = Path(path)

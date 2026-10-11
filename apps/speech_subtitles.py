@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import textwrap
 import numpy as np
 
 from vieneu_utils.core_utils import (
@@ -66,7 +67,7 @@ def _timestamp(milliseconds: int) -> str:
     return f"{hours:02}:{minute:02}:{sec:02},{ms:03}"
 
 
-def render_srt(spans: list[SentenceSpan], sample_rate: int = 48000) -> str:
+def render_srt(spans: list[SentenceSpan], sample_rate: int = 48000, *, line_width: int | None = None) -> str:
     lines = []
     for index, span in enumerate(spans, 1):
         start = (span.start_sample * 1000 + sample_rate // 2) // sample_rate
@@ -75,5 +76,7 @@ def render_srt(spans: list[SentenceSpan], sample_rate: int = 48000) -> str:
         for token, label in ((1, "cười"), (2, "thở dài"), (3, "hắng giọng")):
             text = text.replace(f"<|emotion_{token}|>", f"[{label}]")
         text = re.sub(r"\s+", " ", text).strip()
+        if line_width is not None:
+            text = "\n".join(textwrap.wrap(text, width=line_width, break_on_hyphens=False))
         lines.append(f"{index}\n{_timestamp(start)} --> {_timestamp(end)}\n{text}\n")
     return "\n".join(lines)

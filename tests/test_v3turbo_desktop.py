@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 import importlib.util
@@ -119,48 +120,35 @@ class DesktopToolTests(unittest.TestCase):
         second, _ = sf.read(paths[1])
         self.assertLess(first.max(), second.max())
 
-    def test_only_allowed_effects_are_forwarded_to_audio_pipeline(self):
-        sampling = Sampling(bright=True, compress=True, peak_guard=True)
+    def test_sampling_forwards_only_model_settings(self):
+        sampling = Sampling()
         kwargs = sampling.kwargs()
         self.assertFalse(kwargs["denoise"])
         self.assertFalse(kwargs["apply_watermark"])
         for key in ("bright", "compress", "peak_guard", "speed"):
             self.assertNotIn(key, kwargs)
-        with patch("apps.v3turbo_tool.process_audio", wraps=__import__(
-                "apps.simple_tts_audio", fromlist=["process_audio"]).process_audio) as effects:
-            path = self.tool.synthesize("Hello", sampling=sampling)
-        self.assertTrue(path.exists())
-        self.assertEqual(effects.call_count, 1)
-        options = effects.call_args.args[2]
-        self.assertTrue(options.bright and options.compress and options.peak_guard)
+        self.assertEqual(kwargs["temperature"], sampling.temperature)
 
-    def test_disabled_effects_skip_audio_processing(self):
-        with patch("apps.v3turbo_tool.process_audio", side_effect=AssertionError("unneeded effects")):
-            self.tool.synthesize("Hello", sampling=Sampling())
-
-    def test_srt_reuses_effect_chain_and_keeps_cuda_batch_limit(self):
-        from apps.simple_tts_audio import build_effect_chain
+    def test_srt_keeps_cuda_batch_limit_and_silence(self):
         path = self.folder / "gpu_batch.srt"
         path.write_text("".join(
             f"{i+1}\n00:00:{i*2:02},000 --> 00:00:{i*2+1:02},000\nSentence {i}.\n\n"
             for i in range(6)), encoding="utf-8")
         self.tool.tts.backend = "pytorch"
-        sampling = Sampling(batch_size=2, bright=True, compress=True, peak_guard=True)
+        sampling = Sampling(batch_size=2)
         with patch.object(self.tool.tts, "infer_batch",
-                          side_effect=lambda texts, **kwargs: [self.tone() for _ in texts]) as infer, \
-             patch("apps.v3turbo_tool.build_effect_chain", wraps=build_effect_chain) as build:
+                          side_effect=lambda texts, **kwargs: [self.tone() for _ in texts]) as infer:
             output, note = self.tool.srt(path, sampling=sampling)
         self.assertEqual(infer.call_count, 1)
         self.assertEqual(infer.call_args.kwargs["batch_size"], 2)
-        self.assertEqual(build.call_count, 1)
         wav, rate = sf.read(output)
         self.assertEqual(len(wav), rate*11)
         self.assertTrue(np.all(wav[rate:rate*2] == 0))
         self.assertGreater(float(np.max(np.abs(wav[rate*10:]))), .01)
         self.assertIn("model=", note)
-        self.assertIn("tempo/effects=", note)
+        self.assertIn("tempo=", note)
 
-    def test_srt_without_effects_keeps_the_complete_short_waveform(self):
+    def test_srt_keeps_the_complete_short_waveform(self):
         path = self.folder / "plain.srt"
         path.write_text("1\n00:00:01,000 --> 00:00:02,000\nOne\n", encoding="utf-8")
         voice = np.full(12000, .2, dtype=np.float32)
@@ -170,15 +158,18 @@ class DesktopToolTests(unittest.TestCase):
         np.testing.assert_allclose(actual[48000:60000], voice, atol=1/32768)
         self.assertTrue(np.all(actual[60000:] == 0))
 
-    def test_stream_buffers_effects_once_and_plays_exported_audio(self):
+    def test_stream_original_speed_plays_each_chunk_before_next_inference(self):
         played = []
-        sampling = Sampling(bright=True, compress=True, peak_guard=True)
-        with patch("apps.v3turbo_tool.process_audio", wraps=__import__(
-                "apps.simple_tts_audio", fromlist=["process_audio"]).process_audio) as effects:
-            results = list(self.tool.stream("Hello", sampling=sampling,
-                           on_audio=lambda audio, rate: played.append(audio.copy())))
-        self.assertEqual(effects.call_count, 1)
+        chunks = [np.full(4800, value, dtype=np.float32) for value in (.2, .8)]
+        def source(*args, **kwargs):
+            yield chunks[0]
+            self.assertEqual(len(played), 1)
+            np.testing.assert_array_equal(played[0], chunks[0])
+            yield chunks[1]
+        with patch.object(self.tool.tts, "infer_stream", side_effect=source):
+            results = list(self.tool.stream("Hello", on_audio=lambda audio, rate: played.append(audio.copy())))
         exported, _ = sf.read(results[-1][0])
+        np.testing.assert_array_equal(np.concatenate(played), np.concatenate(chunks))
         np.testing.assert_allclose(np.concatenate(played), exported, atol=1/32768)
 
 
@@ -556,6 +547,77 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(self.tool.tts.calls[0][1]["top_k"], 19)
         self.assertIn("0 câu", note)
 
+    def test_srt_returns_wrapped_subtitle_preserving_source_headers_text_and_file(self):
+        path = self.folder / 'original.srt'
+        sentence = 'Xin chào, đây là câu phụ đề dài để kiểm tra xuống dòng giữa các từ mà vẫn giữ nguyên nội dung. ' * 2
+        source = f'20\n00:00:01,123 --> 00:00:03,456\n<i>{sentence.strip()}</i>\n\n35\n00:00:05,789 --> 00:00:06,900\nCâu ngắn.\n'
+        path.write_text(source, encoding='utf-8-sig')
+        original = path.read_bytes()
+        audio, note = self.tool.srt(path, 'Mai')
+        subtitle = audio.with_suffix('.srt')
+        self.assertEqual(audio.parent, self.folder / path.stem)
+        self.assertEqual(set(audio.parent.iterdir()), {audio, subtitle})
+        wrapped = subtitle.read_text(encoding='utf-8')
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIn('20\n00:00:01,123 --> 00:00:03,456\n', wrapped)
+        self.assertIn('35\n00:00:05,789 --> 00:00:06,900\nCâu ngắn.\n', wrapped)
+        self.assertEqual(parse_srt(wrapped, strict_timing=True), parse_srt(source, strict_timing=True))
+        bodies = [block.splitlines()[2:] for block in wrapped.strip().split('\n\n')]
+        self.assertGreater(len(bodies[0]), 1)
+        self.assertTrue(all(len(line) <= 70 for body in bodies for line in body))
+        self.assertIn('<i>', wrapped)
+        self.assertIn('</i>', wrapped)
+        self.assertIn(subtitle.name, note)
+        generated = {row.path: row.kind for row in self.tool.list_outputs()}
+        self.assertEqual(generated[audio], 'Audio')
+        self.assertEqual(generated[subtitle], 'Phụ đề')
+        restored = TurboTool(self.folder)
+        self.assertEqual({row.path for row in restored.list_outputs()}, {audio, subtitle})
+        self.assertEqual(set(self.tool.delete_outputs([audio])), {audio, subtitle})
+        self.assertTrue(path.is_file())
+
+    def test_srt_subtitle_export_failure_removes_audio_and_allows_retry(self):
+        path = self.folder / 'original.srt'
+        path.write_text('1\n00:00:01,000 --> 00:00:02,000\nXin chào.\n', encoding='utf-8')
+        with patch('apps.v3turbo_tool.wrap_srt_text', side_effect=OSError('subtitle failed')):
+            with self.assertRaisesRegex(OSError, 'subtitle failed'):
+                self.tool.srt(path)
+        self.assertEqual(list(self.folder.glob('srt_*')), [])
+        self.assertEqual(list(self.folder.glob('.srt_*')), [])
+        self.assertFalse((self.folder / path.stem).exists())
+        audio, _ = self.tool.srt(path)
+        self.assertTrue(audio.is_file())
+        self.assertTrue(audio.with_suffix('.srt').is_file())
+
+    def test_srt_repeated_exports_keep_previous_folder_and_accept_flac(self):
+        path = self.folder / 'episode.srt'
+        path.write_text('1\n00:00:00,000 --> 00:00:01,000\nXin chào.\n', encoding='utf-8')
+        first, _ = self.tool.srt(path)
+        previous_audio = first.read_bytes()
+        previous_srt = first.with_suffix('.srt').read_bytes()
+        second, _ = self.tool.srt(path, fmt='flac')
+        self.assertEqual(first.parent.name, 'episode')
+        self.assertEqual(second.parent.name, 'episode_2')
+        self.assertEqual(second.suffix, '.flac')
+        self.assertEqual(first.read_bytes(), previous_audio)
+        self.assertEqual(first.with_suffix('.srt').read_bytes(), previous_srt)
+        self.assertEqual(set(second.parent.iterdir()), {second, second.with_suffix('.srt')})
+        self.assertEqual(len(self.tool.list_outputs()), 4)
+
+    def test_srt_publish_failure_cleans_only_staged_pair_and_releases_lock(self):
+        path = self.folder / 'episode.srt'
+        path.write_text('1\n00:00:00,000 --> 00:00:01,000\nXin chào.\n', encoding='utf-8')
+        previous, _ = self.tool.srt(path)
+        with patch('apps.v3turbo_tool.publish_output_folder', side_effect=OSError('publish failed')):
+            with self.assertRaisesRegex(OSError, 'publish failed'):
+                self.tool.srt(path)
+        self.assertEqual(list(self.folder.glob('.srt_*')), [])
+        self.assertTrue(previous.is_file())
+        self.assertTrue(previous.with_suffix('.srt').is_file())
+        self.assertFalse((self.folder / 'episode_2').exists())
+        next_audio, _ = self.tool.srt(path)
+        self.assertEqual(next_audio.parent.name, 'episode_2')
+
     def test_srt_auto_fit_accelerates_only_long_cues_and_keeps_the_timeline(self):
         path = self.folder / "fit.srt"
         path.write_text("1\n00:00:01,000 --> 00:00:03,000\nOne\n\n"
@@ -731,6 +793,92 @@ class DesktopToolTests(unittest.TestCase):
             with self.assertRaises(Cancelled):
                 self.tool.srt(path, fit_to_timing=True, progress=lambda _: self.tool.stop())
         self.assertEqual(list(self.folder.glob("srt_*.wav")), [])
+        self.assertTrue(self.tool.synthesize("Again").exists())
+
+    def test_srt_native_parallel_fit_matches_sequential_samples_and_windows(self):
+        from apps.srt_timing import cue_sample_windows, prepare_srt_clip
+        path = self.folder / "parallel_native.srt"
+        path.write_text("1\n00:00:00,125 --> 00:00:00,925\nOne\n\n"
+                        "2\n00:00:00,725 --> 00:00:01,725\nTwo\n\n"
+                        "3\n00:00:02,000 --> 00:00:03,000\nThree\n\n"
+                        "4\n00:00:04,000 --> 00:00:05,000\nFour\n", encoding="utf-8")
+        cues = parse_srt(path.read_text(encoding="utf-8"), strict_timing=True)
+        seconds = np.arange(72000, dtype=np.float32) / 48000
+        clips = [np.pad((.1 * np.cos(2*np.pi*freq*seconds[:length])).astype(np.float32), (960, 1920))
+                 for freq, length in ((180, 72000), (240, 48000), (320, 12000), (400, 60000))]
+        originals = [wav.copy() for wav in clips]
+        expected = np.zeros(240000, dtype=np.float32)
+        for clip, (begin, end) in zip(clips, cue_sample_windows(cues)):
+            audio, _ = prepare_srt_clip(clip, end - begin, 1.2)
+            expected[begin:begin+len(audio)] = audio
+        captured, messages = [], []
+        original_save = self.tool._save
+        def save(wav, fmt, **kwargs):
+            captured.append(wav.copy())
+            return original_save(wav, fmt, **kwargs)
+        with patch.object(self.tool.tts, "infer_batch", return_value=clips), \
+             patch.object(self.tool, "_save", side_effect=save):
+            self.tool.srt(path, min_speed=1.2, progress=messages.append)
+        np.testing.assert_array_equal(captured[0], expected)
+        self.assertEqual([message.split(":")[0] for message in messages if message.startswith("SRT câu")],
+                         ["SRT câu 1", "SRT câu 2", "SRT câu 3", "SRT câu 4"])
+        for before, after in zip(originals, clips):
+            np.testing.assert_array_equal(before, after)
+
+    def test_srt_fit_workers_overlap_but_progress_and_inference_stay_on_caller(self):
+        path = self.folder / "overlap_workers.srt"
+        path.write_text("1\n00:00:00,000 --> 00:00:00,250\nOne\n\n"
+                        "2\n00:00:01,000 --> 00:00:01,250\nTwo\n", encoding="utf-8")
+        caller = threading.get_ident()
+        second_started = threading.Event()
+        clips = [np.full(24000, value, dtype=np.float32) for value in (.1, .2)]
+        def prepare(wav, window, speed, **kwargs):
+            self.assertNotEqual(threading.get_ident(), caller)
+            if wav[0] < .15:
+                self.assertTrue(second_started.wait(3))
+            else:
+                second_started.set()
+            return np.full(window, wav[0], dtype=np.float32), len(wav)/window
+        def infer(*args, **kwargs):
+            self.assertEqual(threading.get_ident(), caller)
+            return clips
+        def progress(message):
+            self.assertEqual(threading.get_ident(), caller)
+        with patch.object(self.tool.tts, "infer_batch", side_effect=infer), \
+             patch("apps.v3turbo_tool.prepare_srt_clip", side_effect=prepare):
+            output, _ = self.tool.srt(path, progress=progress)
+        audio, rate = sf.read(output)
+        np.testing.assert_allclose(audio[:12000], .1, atol=1/32768)
+        np.testing.assert_allclose(audio[48000:60000], .2, atol=1/32768)
+        self.assertTrue(np.all(audio[12000:48000] == 0))
+
+    def test_cancelling_parallel_srt_waits_for_workers_and_does_not_export(self):
+        path = self.folder / "cancel_parallel.srt"
+        path.write_text("1\n00:00:00,000 --> 00:00:00,250\nOne\n\n"
+                        "2\n00:00:01,000 --> 00:00:01,250\nTwo\n", encoding="utf-8")
+        second_started, release, finished = (threading.Event() for _ in range(3))
+        clips = [np.full(24000, value, dtype=np.float32) for value in (.1, .2)]
+        def prepare(wav, window, speed, **kwargs):
+            if wav[0] < .15:
+                self.assertTrue(second_started.wait(3))
+                return wav[:window], 2.0
+            second_started.set()
+            try:
+                self.assertTrue(release.wait(3))
+                kwargs['check_stop']()
+            finally:
+                finished.set()
+        def progress(message):
+            if message.startswith("SRT câu 1:"):
+                self.tool.stop()
+                release.set()
+        with patch.object(self.tool.tts, "infer_batch", return_value=clips), \
+             patch("apps.v3turbo_tool.prepare_srt_clip", side_effect=prepare), \
+             patch.object(self.tool, "_save") as save:
+            with self.assertRaises(Cancelled):
+                self.tool.srt(path, progress=progress)
+            save.assert_not_called()
+        self.assertTrue(finished.is_set())
         self.assertTrue(self.tool.synthesize("Again").exists())
 
 
@@ -910,20 +1058,20 @@ class DesktopToolTests(unittest.TestCase):
         self.assertTrue(any("Đang chỉnh tốc độ" in message for path, message in results))
 
 
-    def test_audio_plus_srt_applies_effects_once_after_joining(self):
-        from apps.simple_tts_audio import process_audio
+    def test_audio_plus_srt_preserves_sentence_samples_and_volume(self):
+        from apps.speech_subtitles import assemble_sentence_track, render_srt, subtitle_sentences
+        text = "One. Two."
         clips = [np.full(12000, .1, dtype=np.float32), np.full(24000, .2, dtype=np.float32)]
-        with patch.object(self.tool.tts, "infer_batch", return_value=clips):
-            original = self.tool.synthesize_with_subtitles("One. Two.")
+        expected, spans = assemble_sentence_track(subtitle_sentences(text), clips)
+        captured = []
+        def save(wav, fmt, **kwargs):
+            captured.append(wav.copy())
+            return self.folder / "speech_plain.wav"
         with patch.object(self.tool.tts, "infer_batch", return_value=clips), \
-             patch("apps.v3turbo_tool.process_audio", wraps=process_audio) as effects:
-            result = self.tool.synthesize_with_subtitles(
-                "One. Two.", sampling=Sampling(bright=True, compress=True, peak_guard=True))
-        self.assertEqual(effects.call_count, 1)
-        self.assertEqual(len(effects.call_args.args[0]), sf.info(result.audio).frames)
-        self.assertEqual(sf.info(result.audio).frames, sf.info(original.audio).frames)
-        self.assertEqual(result.subtitles.read_text(encoding="utf-8"),
-                         original.subtitles.read_text(encoding="utf-8"))
+             patch.object(self.tool, "_save", side_effect=save):
+            result = self.tool.synthesize_with_subtitles(text)
+        np.testing.assert_array_equal(captured[0], expected)
+        self.assertEqual(result.subtitles.read_text(encoding="utf-8"), render_srt(spans))
 
     def test_audio_plus_srt_stretches_each_sentence_once(self):
         with patch.object(self.tool.tts, "infer_batch", return_value=[self.tone(), self.tone()]), \
@@ -932,6 +1080,46 @@ class DesktopToolTests(unittest.TestCase):
             result = self.tool.synthesize_with_subtitles("One. Two.", sampling=Sampling(speed=1.2))
         self.assertEqual(stretch.call_count, 2)
         self.assertEqual(len(parse_srt(result.subtitles.read_text(encoding="utf-8"))), 2)
+
+    def test_subtitle_tempo_workers_overlap_and_keep_sentence_order(self):
+        second_started = threading.Event()
+        clips = [np.full(24000, value, dtype=np.float32) for value in (.1, .2)]
+        def stretch(wav, speed, **kwargs):
+            if wav[0] < .15:
+                self.assertTrue(second_started.wait(3))
+            else:
+                second_started.set()
+            return np.full(round(len(wav) / speed), wav[0], dtype=np.float32)
+        with patch.object(self.tool.tts, "infer_batch", return_value=clips), \
+             patch("apps.v3turbo_tool.stretch_rubberband", side_effect=stretch):
+            result = self.tool.synthesize_with_subtitles("First. Second.", sampling=Sampling(speed=1.25))
+        wav, rate = sf.read(result.audio, dtype="float32")
+        cues = parse_srt(result.subtitles.read_text(encoding="utf-8"))
+        self.assertAlmostEqual(float(wav[0]), .1, places=4)
+        self.assertAlmostEqual(float(wav[round(cues[1].start_ms * rate / 1000)]), .2, places=4)
+        self.assertEqual([cue.text for cue in cues], ["First.", "Second."])
+        self.assertTrue(all(value >= 0 for value in result.timings.values()))
+
+    def test_parallel_native_tempo_preserves_samples_and_srt_of_sequential_processing(self):
+        from apps.speech_speed import stretch_rubberband
+        from apps.speech_subtitles import assemble_sentence_track, render_srt, subtitle_sentences
+        text = "First. Second. Third. Fourth."
+        seconds = np.arange(48000, dtype=np.float32) / 48000
+        clips = [(np.sin(2 * np.pi * freq * seconds) * .1).astype(np.float32) for freq in (180, 230, 310, 390)]
+        original = [wav.copy() for wav in clips]
+        adjusted = [stretch_rubberband(wav, 1.25) for wav in clips]
+        expected, spans = assemble_sentence_track(subtitle_sentences(text), adjusted)
+        captured = []
+        def save(wav, fmt, **kwargs):
+            captured.append(wav.copy())
+            return self.folder / "native_tempo.wav"
+        with patch.object(self.tool.tts, "infer_batch", return_value=clips), \
+             patch.object(self.tool, "_save", side_effect=save):
+            result = self.tool.synthesize_with_subtitles(text, sampling=Sampling(speed=1.25))
+        np.testing.assert_array_equal(captured[0], expected)
+        self.assertEqual(result.subtitles.read_text(encoding="utf-8"), render_srt(spans))
+        for before, after in zip(original, clips):
+            np.testing.assert_array_equal(before, after)
 
     def test_cuda_subtitles_use_larger_window_but_keep_sdk_batch_cap(self):
         self.tool.tts.backend = "pytorch"
@@ -945,6 +1133,104 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(result.sentences, 6)
         self.assertTrue(all(value >= 0 for value in result.timings.values()))
         self.assertGreaterEqual(result.timings["total"], result.timings["model"])
+
+    def test_cuda_tempo_pipeline_preserves_native_samples_subtitles_and_sdk_limit(self):
+        from apps.speech_speed import stretch_rubberband
+        from apps.speech_subtitles import assemble_sentence_track, render_srt, subtitle_sentences
+        self.tool.tts.backend = "pytorch"
+        self.tool.tts.engine = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        text = "One. Two. Three. Four. Five. Six. Seven. Eight. Nine."
+        seconds = np.arange(24000, dtype=np.float32) / 48000
+        clips = [(np.sin(2 * np.pi * (170 + index * 30) * seconds) * .1).astype(np.float32)
+                 for index in range(9)]
+        expected, spans = assemble_sentence_track(
+            subtitle_sentences(text), [stretch_rubberband(wav, 1.25) for wav in clips])
+        captured, inferred, messages = [], [], []
+        caller = threading.get_ident()
+        def infer(texts, **kwargs):
+            self.assertEqual(threading.get_ident(), caller)
+            self.assertEqual(kwargs["batch_size"], 1)
+            start = sum(inferred)
+            inferred.append(len(texts))
+            return clips[start:start + len(texts)]
+        original_save = self.tool._save
+        def save(wav, fmt, **kwargs):
+            captured.append(wav.copy())
+            return original_save(wav, fmt, **kwargs)
+        def progress(message):
+            self.assertEqual(threading.get_ident(), caller)
+            messages.append(message)
+        with patch.object(self.tool.tts, "infer_batch", side_effect=infer), \
+             patch.object(self.tool, "_save", side_effect=save):
+            result = self.tool.synthesize_with_subtitles(
+                text, sampling=Sampling(speed=1.25, batch_size=1), progress=progress)
+        self.assertEqual(inferred, [4, 4, 1])
+        np.testing.assert_array_equal(captured[0], expected)
+        self.assertEqual(result.subtitles.read_text(encoding="utf-8"), render_srt(spans))
+        self.assertEqual([message.split("đã đọc ")[1] for message in messages],
+                         ["4/9 câu", "8/9 câu", "9/9 câu"])
+
+    def test_cuda_srt_pipeline_preserves_windows_and_progress_order(self):
+        from apps.srt_timing import prepare_srt_clip
+        self.tool.tts.backend = "pytorch"
+        self.tool.tts.engine = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        path = self.folder / "pipeline.srt"
+        path.write_text("".join(
+            f"{i+1}\n00:00:{i*2:02},125 --> 00:00:{i*2+1:02},125\nSentence {i}.\n\n"
+            for i in range(5)), encoding="utf-8")
+        seconds = np.arange(60000, dtype=np.float32) / 48000
+        clips = [(np.sin(2*np.pi*(180+index*30)*seconds)*.1).astype(np.float32)
+                 for index in range(5)]
+        expected = np.zeros(438000, dtype=np.float32)
+        for index, wav in enumerate(clips):
+            audio, _ = prepare_srt_clip(wav, 48000, 1.25)
+            begin = (index * 2000 + 125) * 48
+            expected[begin:begin+len(audio)] = audio
+        captured, messages = [], []
+        def infer(texts, **kwargs):
+            start = 0 if len(texts) == 4 else 4
+            return clips[start:start+len(texts)]
+        original_save = self.tool._save
+        def save(wav, fmt, **kwargs):
+            captured.append(wav.copy())
+            return original_save(wav, fmt, **kwargs)
+        with patch.object(self.tool.tts, "infer_batch", side_effect=infer), \
+             patch.object(self.tool, "_save", side_effect=save):
+            output, _ = self.tool.srt(path, sampling=Sampling(batch_size=1),
+                                      min_speed=1.25, progress=messages.append)
+        np.testing.assert_array_equal(captured[0], expected)
+        self.assertEqual([message.split(":")[0] for message in messages if message.startswith("SRT câu")],
+                         [f"SRT câu {index}" for index in range(1, 6)])
+        self.assertTrue(output.is_file())
+
+    def test_cancelled_cuda_pipeline_waits_for_workers_without_exporting(self):
+        self.tool.tts.backend = "pytorch"
+        self.tool.tts.engine = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+        worker_started, release, worker_finished = (threading.Event() for _ in range(3))
+        calls = []
+        def infer(texts, **kwargs):
+            if calls:
+                self.assertTrue(worker_started.wait(3))
+                release.set()
+            calls.append(texts)
+            return [self.tone() for _ in texts]
+        def stretch(wav, speed, **kwargs):
+            worker_started.set()
+            self.assertTrue(release.wait(3))
+            worker_finished.set()
+            return wav
+        def progress(message):
+            self.tool.stop()
+        with patch.object(self.tool.tts, "infer_batch", side_effect=infer), \
+             patch("apps.v3turbo_tool.stretch_rubberband", side_effect=stretch), \
+             patch.object(self.tool, "_save") as save:
+            with self.assertRaises(Cancelled):
+                self.tool.synthesize_with_subtitles(
+                    "One. Two. Three. Four. Five.", sampling=Sampling(speed=1.25, batch_size=1),
+                    progress=progress)
+            save.assert_not_called()
+        self.assertTrue(worker_finished.is_set())
+        self.assertTrue(self.tool.synthesize("Again").is_file())
 
     def test_text_generates_audio_and_sentence_srt_with_actual_timing(self):
         text = "Câu một. Câu hai?\nCâu ba!"
@@ -996,6 +1282,23 @@ class DesktopToolTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.tool.synthesize_with_subtitles("Một câu.")
         self.assertEqual(list(self.folder.glob("speech_subtitled_*")), [])
+
+    def test_audio_write_failure_removes_partial_file_and_allows_retry(self):
+        old = self.folder / "speech_000000000001.wav"
+        old.write_bytes(b"older result")
+
+        def fail(path, *args, **kwargs):
+            Path(path).write_bytes(b"partial audio")
+            raise OSError("Disk write failed")
+
+        with patch("apps.v3turbo_tool.sf.write", side_effect=fail):
+            with self.assertRaisesRegex(OSError, "Disk write failed"):
+                self.tool.synthesize_with_subtitles("First sentence.")
+        self.assertEqual(list(self.folder.glob("speech_subtitled_*")), [])
+        self.assertEqual(old.read_bytes(), b"older result")
+        result = self.tool.synthesize_with_subtitles("First sentence.")
+        self.assertTrue(result.audio.is_file())
+        self.assertTrue(result.subtitles.is_file())
 
 
 if __name__ == "__main__":

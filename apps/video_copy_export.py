@@ -47,10 +47,15 @@ def _packet_filter(mapping) -> str:
     expression = _mapped_clock(source, output)
     pts = f"st(0,PTS*TB);({expression})/TB_OUT"
     dts = f"st(0,DTS*TB);({expression})/TB_OUT"
-    # Map both endpoints rather than multiplying duration by one local slope:
-    # a frame's display interval can straddle a marker or a smooth speed ramp.
-    duration = (f"st(0,(PTS+DURATION)*TB);st(1,{expression});"
-                f"st(0,PTS*TB);max(1,(ld(1)-({expression}))/TB_OUT)")
+    # MP4 derives sample-table duration from decode timestamps. At EOF,
+    # include the reordered-frame delay so the presentation tail is not cut.
+    duration = (
+        f"if(eq(NEXT_DTS,NOPTS),"
+        f"st(0,STARTDTS*TB);st(1,{expression});"
+        f"st(0,DTS*TB);max(1,({float(output[-1]):.17g}+ld(1)-({expression}))/TB_OUT),"
+        f"st(0,NEXT_DTS*TB);st(1,{expression});"
+        f"st(0,DTS*TB);max(1,(ld(1)-({expression}))/TB_OUT))"
+    )
     return (f"setts=pts='{pts}':dts='{dts}':duration='{duration}':"
             "time_base=1/1000000")
 

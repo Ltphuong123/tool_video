@@ -305,7 +305,7 @@ class MarkerRenderTests(unittest.TestCase):
         output = self.directory / "aligned.mp4"
         progress = []
         mapping = render_marker_alignment(self.source, output, self.old, self.new,
-                                          preset="ultrafast", progress=progress.append)
+                                          keep_audio=True, preset="ultrafast", progress=progress.append)
         information = probe_video(output)
         self.assertEqual(information["fps"], 24)
         self.assertTrue(information["has_audio"])
@@ -327,7 +327,7 @@ class MarkerRenderTests(unittest.TestCase):
         output = self.directory / "identity.mp4"
         with patch("apps.speech_speed.require_rubberband", side_effect=AssertionError("unused")):
             mapping = render_marker_alignment(self.source, output, self.old, self.old,
-                                              preset="ultrafast")
+                                              keep_audio=True, preset="ultrafast")
         self.assertEqual(mapping.output_duration, 2)
         self.assertTrue(probe_video(output)["has_audio"])
 

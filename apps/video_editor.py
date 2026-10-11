@@ -218,7 +218,8 @@ def render_speed_segment(source, destination, start: float, end: float,
                          speed: float = 1.5, ramp_seconds: float = 0.5,
                          keep_audio: bool = False, quality: int = 20,
                          preset: str = "fast", check_stop: Callable = lambda: None,
-                         progress: Callable = lambda fraction: None) -> SpeedTimeMap:
+                         progress: Callable = lambda fraction: None,
+                         export_mode: str = "encode") -> SpeedTimeMap:
     """Create a new MP4, keeping all frames outside the selected source range.
 
     Progress is a fraction in [0, 1]. The source remains open only while
@@ -227,20 +228,21 @@ def render_speed_segment(source, destination, start: float, end: float,
     return _render_speed_mapping(
         source, destination,
         lambda duration: build_speed_time_map(duration, start, end, speed, ramp_seconds),
-        keep_audio, quality, preset, check_stop, progress,
+        keep_audio, quality, preset, check_stop, progress, export_mode,
     )
 
 
 def render_speed_segments(source, destination, segments: Iterable[SpeedSegment],
                           keep_audio: bool = False, quality: int = 20,
                           preset: str = "fast", check_stop: Callable = lambda: None,
-                          progress: Callable = lambda fraction: None) -> MultiSpeedTimeMap:
+                          progress: Callable = lambda fraction: None,
+                          export_mode: str = "encode") -> MultiSpeedTimeMap:
     """Render multiple source ranges using one shared video/audio timeline."""
     segments = tuple(segments)
     return _render_speed_mapping(
         source, destination,
         lambda duration: build_multi_speed_time_map(duration, segments),
-        keep_audio, quality, preset, check_stop, progress,
+        keep_audio, quality, preset, check_stop, progress, export_mode,
     )
 
 
@@ -248,7 +250,8 @@ def render_marker_alignment(source, destination, old_markers: Iterable[TimeMarke
                             new_markers: Iterable[TimeMarker],
                             keep_audio: bool = False, quality: int = 20,
                             preset: str = "fast", check_stop: Callable = lambda: None,
-                            progress: Callable = lambda fraction: None) -> MarkerTimeMap:
+                            progress: Callable = lambda fraction: None,
+                            export_mode: str = "encode") -> MarkerTimeMap:
     """Render the exact marker alignment with the shared video/audio pipeline."""
     from apps.video_markers import build_marker_time_map
 
@@ -256,13 +259,13 @@ def render_marker_alignment(source, destination, old_markers: Iterable[TimeMarke
     return _render_speed_mapping(
         source, destination,
         lambda duration: build_marker_time_map(duration, old_markers, new_markers),
-        keep_audio, quality, preset, check_stop, progress,
+        keep_audio, quality, preset, check_stop, progress, export_mode,
     )
 
 
 def _render_speed_mapping(source, destination, mapping_factory: Callable,
                            keep_audio: bool, quality: int, preset: str,
-                           check_stop: Callable, progress: Callable):
+                           check_stop: Callable, progress: Callable, export_mode: str = "encode"):
     source = Path(source).expanduser().resolve()
     destination = Path(destination).expanduser().resolve()
     if not source.is_file():
@@ -271,12 +274,14 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
         raise ValueError("Chọn file MP4 mới; không được ghi đè video nguồn hoặc file đã có.")
     if destination.suffix.lower() != ".mp4":
         raise ValueError("Video đầu ra phải có đuôi .mp4.")
-    if not isinstance(quality, int) or isinstance(quality, bool) or not 0 <= quality <= 51:
+    if export_mode not in ("copy", "encode"):
+        raise ValueError("Chế độ xuất video phải là copy hoặc encode.")
+    if export_mode == "encode" and (not isinstance(quality, int) or isinstance(quality, bool) or not 0 <= quality <= 51):
         raise ValueError("Chất lượng CRF phải là số nguyên trong 0–51.")
-    if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"):
+    if export_mode == "encode" and preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"):
         raise ValueError("Preset mã hóa video không hợp lệ.")
     check_stop()
-    VideoFileClip, _, ProgressBarLogger = require_moviepy()
+    VideoFileClip, AudioFileClip, ProgressBarLogger = require_moviepy()
     from apps.video_fast_export import (
         can_render_ffmpeg, get_video_encoding_options, render_video_ffmpeg,
     )
@@ -284,7 +289,7 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
     token = uuid.uuid4().hex
     partial = destination.parent / f".video_{token}.mp4"
     mux_audio = destination.parent / f".video_{token}.m4a"
-    source_clip = output_clip = None
+    source_clip = output_clip = source_audio = None
     video_start = 0.25 if keep_audio else 0.0
     video_span = 0.99 - video_start
 
@@ -301,10 +306,25 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
 
     try:
         progress(0)
-        source_clip = VideoFileClip(str(source), audio=keep_audio, audio_fps=48000)
-        _guard_reader_cleanup(source_clip)
-        mapping = mapping_factory(source_clip.duration)
-        fps = float(source_clip.fps)
+        if export_mode == "copy":
+            # Reading metadata does not decode any RGB frames or start an
+            # encoder. Only the optional audio reader needs decoded samples.
+            from moviepy.video.io.ffmpeg_reader import ffmpeg_parse_infos
+
+            info = ffmpeg_parse_infos(str(source))
+            if not info.get("video_found"):
+                raise ValueError("File đầu vào không có hình video.")
+            mapping = mapping_factory(float(info["duration"]))
+            fps = float(info["video_fps"])
+            if keep_audio and info.get("audio_found"):
+                source_audio = AudioFileClip(str(source), fps=48000)
+                _guard_reader_cleanup(source_audio)
+        else:
+            source_clip = VideoFileClip(str(source), audio=keep_audio, audio_fps=48000)
+            _guard_reader_cleanup(source_clip)
+            mapping = mapping_factory(source_clip.duration)
+            fps = float(source_clip.fps)
+            source_audio = source_clip.audio
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("Không đọc được FPS hợp lệ từ video nguồn.")
         if mapping.output_duration * fps < 1:
@@ -314,19 +334,27 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
             check_stop()
             return mapping.source_time(t)
 
-        has_audio = keep_audio and source_clip.audio is not None
-        if keep_audio and source_clip.audio is not None:
+        has_audio = keep_audio and source_audio is not None
+        if has_audio:
             if all(segment.speed == 1 for segment in mapping.segments):
-                _encode_audio(source_clip.audio, mux_audio, check_stop=check_stop,
+                _encode_audio(source_audio, mux_audio, check_stop=check_stop,
                               progress=lambda fraction: progress(0.25 * fraction))
             else:
                 from apps.video_export_audio import encode_mapped_audio
 
-                encode_mapped_audio(source_clip.audio, mux_audio, mapping,
+                encode_mapped_audio(source_audio, mux_audio, mapping,
                                     check_stop=check_stop,
                                     progress=lambda fraction: progress(0.25 * fraction))
         progress(video_start)
-        if can_render_ffmpeg(mapping):
+        if export_mode == "copy":
+            from apps.video_copy_export import render_video_copy
+
+            render_video_copy(
+                source, partial, mapping, audio_path=mux_audio if has_audio else None,
+                check_stop=check_stop,
+                progress=lambda fraction: progress(video_start + video_span * fraction),
+            )
+        elif can_render_ffmpeg(mapping):
             # All shared timelines, including smooth ramps, stay inside
             # FFmpeg, avoiding Python RGB copies and repeated seeking.
             render_video_ffmpeg(
@@ -367,6 +395,8 @@ def _render_speed_mapping(source, destination, mapping_factory: Callable,
         try:
             if source_clip is not None:
                 source_clip.close()
+            elif source_audio is not None:
+                source_audio.close()
         finally:
             for path in (partial, mux_audio):
                 path.unlink(missing_ok=True)

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import time
+from types import SimpleNamespace
 import tkinter as tk
 from tkinter import ttk
 import unittest
@@ -16,32 +18,6 @@ from apps.v3turbo_desktop import DesktopApp
 from apps.v3turbo_tool import Sampling, TurboTool
 from apps.video_editor import SpeedSegment
 from apps.video_timeline import VideoTimeline
-
-
-class FakeVideoPreview(ttk.Frame):
-    """A real Tk layout surface with no decoder thread or FFmpeg reader."""
-
-    def __init__(self, parent, on_position=None, **kwargs):
-        super().__init__(parent, **kwargs)
-        self.canvas = tk.Canvas(self, width=480, height=270, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.ready = False
-        self.playing = False
-        self.duration = self.position = 0.0
-        self.fps = 30.0
-        self.on_position = on_position or (lambda seconds, playing: None)
-        self.open = Mock()
-        self.set_segments = Mock()
-        self.set_audio_enabled = Mock(side_effect=lambda enabled: self.on_position(self.position, self.playing))
-        self.seek = Mock(side_effect=self._seek)
-        self.play = Mock(side_effect=lambda: setattr(self, "playing", True))
-        self.pause = Mock(side_effect=lambda: setattr(self, "playing", False))
-        self.unload = Mock()
-        self.close = Mock()
-
-    def _seek(self, seconds):
-        self.position = seconds
-        self.on_position(seconds, self.playing)
 
 
 class DesktopUITests(unittest.TestCase):
@@ -74,11 +50,8 @@ class DesktopUITests(unittest.TestCase):
         self.input_audio = self.destination / "my_input.wav"
         self.input_audio.write_bytes(b"input")
         self.tool = TurboTool(self.destination, settings_path=self.settings)
-        self.preview_patch = patch("apps.v3turbo_desktop.VideoPreview", FakeVideoPreview)
-        self.preview_patch.start()
-        self.addCleanup(self.preview_patch.stop)
         try:
-            self.app = DesktopApp(self.root, self.tool)
+            self.app = DesktopApp(self.root, self.tool, autoload=False)
         except Exception:
             self.root.destroy()
             self.temp.cleanup()
@@ -94,7 +67,7 @@ class DesktopUITests(unittest.TestCase):
     def _dispose_app(self):
         # A second Tk interpreter should not inherit callbacks from an old root.
         for identifier in self.root.tk.call("after", "info"):
-            self.root.after_cancel(identifier)
+            self.root.tk.call("after", "cancel", identifier)
         self.app.busy = False
         self.app.close()
 
@@ -137,22 +110,6 @@ class DesktopUITests(unittest.TestCase):
         self._pump_until(lambda: page.winfo_ismapped() and page.winfo_viewable(), page)
         self.assertTrue(page.winfo_ismapped(), self._layout_diagnostics(page))
 
-    def _load_video(self, duration=40):
-        source = self.folder / "original video.mp4"
-        source.write_bytes(b"input video")
-        self.app.video_path.set(str(source))
-        self.app.video_preview.ready = True
-        self.app.video_preview.duration = duration
-        self.app._video_loaded(dict(duration=duration, fps=30, width=1920, height=1080,
-                                    has_audio=True))
-        return source
-
-    def _add_segment(self, start, end, speed=1.5, ramp=0.5):
-        self.app.video_start.set(str(start))
-        self.app.video_end.set(str(end))
-        self.app.video_speed.set(str(speed))
-        self.app.video_ramp.set(str(ramp))
-        self.app.add_video_segment()
 
     def test_text_and_srt_hide_storage_and_reference(self):
         self.assertFalse(hasattr(self.app, "reference"))
@@ -222,7 +179,7 @@ class DesktopUITests(unittest.TestCase):
         for task in panel.tasks:
             row = panel.rows[task.identifier]
             self.assertEqual(row["state"], "done")
-            self.assertEqual(float(row["bar"]["value"]), 100)
+            self.assertEqual(float(row["progress"]), 100)
 
     def test_queue_rows_progress_remove_and_busy_guard(self):
         from apps.desktop_queue import QueueTask
@@ -231,7 +188,7 @@ class DesktopUITests(unittest.TestCase):
         panel.add(task)
         panel.update_task(task.identifier, "running", None)
         panel.update_task(task.identifier, "progress", "SRT 3/10 câu")
-        self.assertEqual(float(panel.rows[task.identifier]["bar"]["value"]), 30)
+        self.assertEqual(float(panel.rows[task.identifier]["progress"]), 30)
         panel.update_task(task.identifier, "cancelled", "stop")
         self.assertEqual(panel.pending(), (task,))
         panel.rows[task.identifier]["selected"].set(True)
@@ -243,7 +200,8 @@ class DesktopUITests(unittest.TestCase):
         self.assertEqual(panel.tasks, [])
 
     def test_removed_tabs_and_voice_refresh_are_pruned(self):
-        self.assertEqual(set(self.app.pages), {"Văn bản", "SRT", "Video", "Kết quả / Log", "Cấu hình"})
+        self.assertEqual(set(self.app.pages), {"Văn bản", "SRT", "Tự động vietsub video", "Kết quả / Log", "Cấu hình"})
+        self.assertFalse(hasattr(self.app, "video_preview"))
         self.assertFalse(hasattr(self.app, "training_job"))
         self.assertFalse(hasattr(self.app, "record_microphone"))
         with patch.object(self.tool, "voice_names", wraps=self.tool.voice_names) as voices:
@@ -251,15 +209,151 @@ class DesktopUITests(unittest.TestCase):
             self.app.refresh_voices()
             self.assertEqual(voices.call_count, 1)
 
-    def test_configuration_default_effects_and_hidden_reference_codes(self):
+    def _restart_with_autoload(self):
+        self._dispose_app()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = DesktopApp(self.root, self.tool)
+
+    def _fake_loaded_model(self):
+        self.tool.tts = SimpleNamespace(
+            backend="pytorch", _default_voice="Test voice", close=Mock(),
+            list_preset_voices=Mock(return_value=[("test", "Test voice")]))
+        return "Model ready"
+
+    def test_startup_loads_once_in_background_and_keeps_ui_responsive(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        caller_threads = []
+
+        def load(**kwargs):
+            caller_threads.append(threading.get_ident())
+            release.wait(3)
+            return self._fake_loaded_model()
+
+        with patch.object(self.tool, "load", side_effect=load) as loading:
+            self._restart_with_autoload()
+            self.assertTrue(self._pump_until(lambda: bool(caller_threads)))
+            self.assertTrue(self.app.busy)
+            self.assertNotEqual(caller_threads[0], threading.get_ident())
+            self.assertIn("Đang tải", self.app.model_state.get())
+            self.assertTrue(all("disabled" in button.state() for button in self.app.action_buttons))
+            ui_tick = []
+            self.root.after(0, lambda: ui_tick.append(True))
+            self.assertTrue(self._pump_until(lambda: bool(ui_tick)))
+            release.set()
+            self.assertTrue(self._pump_until(lambda: not self.app.busy))
+            loading.assert_called_once()
+            self.assertEqual(loading.call_args.kwargs["backbone_repo"], self.app.vars["backbone_repo"].get())
+            self.assertEqual(self.app.voice.get(), "Test voice")
+            self.assertIn("PYTORCH", self.app.model_state.get())
+            self.assertTrue(all("disabled" not in button.state() for button in self.app.action_buttons))
+
+    def test_startup_load_failure_restores_controls_and_allows_retry(self):
+        with patch.object(self.tool, "load", side_effect=RuntimeError("Cannot load model")) as loading, \
+             patch("apps.v3turbo_desktop.messagebox.showerror") as error:
+            self._restart_with_autoload()
+            self.assertTrue(self._pump_until(lambda: loading.called and not self.app.busy))
+            error.assert_called_once()
+            self.assertEqual(self.app.status.get(), "Cannot load model")
+            self.assertEqual(self.app.model_state.get(), "Model chưa tải")
+            loading.side_effect = lambda **kwargs: self._fake_loaded_model()
+            self.app.load_model()
+            self.assertTrue(self._pump_until(lambda: not self.app.busy))
+            self.assertEqual(loading.call_count, 2)
+            self.assertEqual(self.app.status.get(), "Model ready")
+
+    def test_startup_reuses_an_already_loaded_model(self):
+        self._restart_with_autoload()
+        self._fake_loaded_model()
+        with patch.object(self.tool, "load") as loading:
+            self.root.update()
+            loading.assert_not_called()
+            self.assertIn("PYTORCH", self.app.model_state.get())
+            self.assertFalse(self.app.busy)
+
+    def test_close_before_startup_cancels_model_loading(self):
+        with patch.object(self.tool, "load") as loading:
+            self._restart_with_autoload()
+            self.assertIsNotNone(self.app._autoload_handle)
+            self.app.close()
+            loading.assert_not_called()
+            self.assertIsNone(self.app._autoload_handle)
+
+    def test_check_mode_can_build_ui_without_loading_model(self):
+        with patch.object(self.tool, "load") as loading:
+            self.root.update()
+            loading.assert_not_called()
+            self.assertIsNone(self.app._autoload_handle)
+
+    def test_close_during_model_loading_releases_model_after_worker_finishes(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        closed_model = []
+
+        def load(**kwargs):
+            release.wait(3)
+            result = self._fake_loaded_model()
+            closed_model.append(self.tool.tts.close)
+            return result
+
+        with patch.object(self.tool, "load", side_effect=load):
+            self._restart_with_autoload()
+            self.assertTrue(self._pump_until(lambda: self.app.busy))
+            self.app.close()
+            release.set()
+            self.app._worker.join(3)
+            self.assertFalse(self.app._worker.is_alive())
+            self.assertIsNone(self.tool.tts)
+            closed_model[0].assert_called_once()
+            self.assertTrue(self.app.events.empty())
+
+    def test_close_after_worker_returns_before_ui_drains_releases_model(self):
+        with patch.object(self.tool, "load", side_effect=lambda **kwargs: self._fake_loaded_model()):
+            self.app.load_model()
+            self.app._worker.join(3)
+            self.assertTrue(self.app.busy)
+            model_close = self.tool.tts.close
+            self.app.close()
+            model_close.assert_called_once()
+            self.assertIsNone(self.tool.tts)
+
+    def test_progress_flood_finishes_queue_without_repeated_history_scans(self):
+        from apps.desktop_queue import QueueTask
+        panel = self.app.queue_panels["SRT"]
+        task = QueueTask("source.srt", source=self.subtitle)
+        panel.add(task)
+        self.app.busy = True
+        self.app._post("queue", ("SRT", task.identifier, "running", None))
+        for index in range(1000):
+            self.app._post("queue", ("SRT", task.identifier, "progress", f"SRT {index}/1000 câu"))
+        self.app._post("queue", ("SRT", task.identifier, "done", (self.paired_audio, "done")))
+        self.app._post("done", (None, lambda _: self.app.refresh_history(), None))
+        with patch.object(self.tool, "list_outputs", wraps=self.tool.list_outputs) as scan:
+            self.assertTrue(self._pump_until(lambda: not self.app.busy))
+            scan.assert_called_once()
+        self.assertEqual(panel.rows[task.identifier]["state"], "done")
+        self.assertEqual(panel.rows[task.identifier]["progress"], 100)
+
+    def test_refresh_keeps_inline_selection_and_unchanged_rows(self):
+        table, paths = self.app.inline_histories["Văn bản"]
+        identifier = next(key for key, path in paths.items() if path == self.paired_audio)
+        table.selection_set(identifier)
+        self.app.refresh_history()
+        self.assertEqual(table.selection(), (identifier,))
+        sf.write(self.destination / "speech_000000000018.wav", [0, .1, 0], 48000)
+        self.app.refresh_history()
+        self.assertEqual([paths[key] for key in table.selection()], [self.paired_audio])
+
+
+    def test_configuration_has_no_effect_controls_and_keeps_reference_codes(self):
         self.assertNotIn("use_ref_codes", self.app.vars)
         sampling = self.app._sampling()
         self.assertTrue(sampling.use_ref_codes)
-        self.assertTrue(sampling.bright and sampling.compress and sampling.peak_guard)
         for key in ("bright", "compress", "peak_guard"):
-            self.app.vars[key].set(False)
-        sampling = self.app._sampling()
-        self.assertFalse(sampling.bright or sampling.compress or sampling.peak_guard)
+            self.assertNotIn(key, self.app.vars)
+            self.assertFalse(hasattr(sampling, key))
+
 
     def test_text_page_buttons_are_compact_and_queue_only(self):
         labels = {str(button.cget("text")) for button in self.app.action_buttons}
@@ -283,6 +377,25 @@ class DesktopUITests(unittest.TestCase):
         self.assertEqual(player.play_file.call_args.args, (path,))
         self.assertTrue(player.play_file.call_args.kwargs["skip_initial_silence"])
         self.assertTrue(callable(player.play_file.call_args.kwargs["on_start"]))
+
+    def test_srt_inline_history_opens_and_saves_generated_pair_when_main_history_is_filtered(self):
+        from test_v3turbo_desktop import FakeTurbo
+        self.tool.tts = FakeTurbo()
+        audio, _ = self.tool.srt(self.subtitle)
+        paired = audio.with_suffix('.srt')
+        self.app.refresh_history()
+        self.app.history_kind.set('Phụ đề')
+        table, paths = self.app.inline_histories['SRT']
+        table.selection_set(next(key for key, value in paths.items() if value == audio))
+        folder = self.folder / 'saved_pair'
+        folder.mkdir()
+        with patch.object(self.app, '_open_file') as opening:
+            self.app.open_inline_subtitle('SRT')
+            opening.assert_called_once_with(paired)
+        with patch('apps.v3turbo_desktop.filedialog.askdirectory', return_value=str(folder)):
+            self.app._save_subtitle_pair(self.app._inline_selected('SRT'))
+        self.assertEqual((folder / audio.name).read_bytes(), audio.read_bytes())
+        self.assertEqual((folder / paired.name).read_bytes(), paired.read_bytes())
 
     def test_inline_playback_uses_internal_player_without_opening_another_app(self):
         table, paths = self.app.inline_histories["Văn bản"]
@@ -329,181 +442,12 @@ class DesktopUITests(unittest.TestCase):
         self.assertNotIn(self.library, self._paths())
         self.assertNotIn(self.input_audio, self._paths())
         self.assertIsNone(self.tool.tts)
-        self.assertEqual(self.app._sampling(), Sampling(bright=True, compress=True, peak_guard=True))
+        self.assertEqual(self.app._sampling(), Sampling())
         self.assertNotIn("speed_method", self.app.vars)
         self.assertEqual(float(self.app.srt_min_speed.get()), 1.0)
         self.assertEqual(str(self.app.history.cget("selectmode")), "extended")
-        self.assertIn("Video", self.app.pages)
-        self.assertEqual(self.app.video_path.get(), "")
-        self.assertEqual(float(self.app.video_start.get()), 0.0)
-        self.assertEqual(float(self.app.video_end.get()), 10.0)
-        self.assertEqual(float(self.app.video_speed.get()), 1.5)
-        self.assertEqual(float(self.app.video_ramp.get()), 0.5)
-        self.assertFalse(hasattr(self.app, "video_keep_audio"))
+        self.assertNotIn("Video", self.app.pages)
 
-    def test_video_export_forwards_all_applied_segments_and_audio_without_loading_tts(self):
-        source = self._load_video()
-        self._add_segment(2, 5, speed=2, ramp=0.5)
-        self._add_segment(12.5, 23.75, speed=0.8, ramp=1.25)
-        expected = tuple(self.app.video_segments)
-        result = self.destination / "video_000000000006.mp4"
-        with patch.object(self.tool, "edit_video_segments", return_value=(result, "Finished")) as render, \
-             patch.object(self.app, "_job", side_effect=lambda function, *args: function()):
-            self.app.export_video()
-            self.assertEqual(render.call_args.args, (str(source), expected))
-            self.assertEqual(render.call_args.kwargs["keep_audio"], False)
-            self.assertEqual(render.call_args.kwargs["quality"], 20)
-            self.assertEqual(render.call_args.kwargs["preset"], "fast")
-            self.assertTrue(callable(render.call_args.kwargs["progress"]))
-        self.assertIsNone(self.tool.tts)
-
-    def test_video_preview_is_muted_without_sound_controls(self):
-        self.app.video_preview.set_audio_enabled.assert_called_once_with(False)
-        self.assertFalse(hasattr(self.app, "video_sound"))
-        self.assertFalse(hasattr(self.app, "video_keep_audio"))
-
-    def test_video_segment_form_rejects_non_numeric_fields_before_mutating_selection(self):
-        self._load_video()
-        self._add_segment(2, 5)
-        expected = list(self.app.video_segments)
-        for variable in (self.app.video_start, self.app.video_end,
-                         self.app.video_speed, self.app.video_ramp):
-            previous = variable.get()
-            with self.subTest(field=str(variable)), patch.object(self.app, "_job") as job:
-                variable.set("invalid number")
-                try:
-                    for action in (self.app.add_video_segment, self.app.apply_video_segment):
-                        with self.assertRaises(ValueError):
-                            action()
-                    self.assertEqual(self.app.video_segments, expected)
-                    job.assert_not_called()
-                finally:
-                    variable.set(previous)
-
-    def test_video_segments_add_update_delete_keep_preview_and_timeline_in_sync(self):
-        self._load_video()
-        self._add_segment(12, 16, speed=0.8, ramp=1)
-        self._add_segment(2, 5, speed=2, ramp=0.5)
-        self.assertEqual(self.app.video_segments,
-                         [SpeedSegment(2, 5, 2, 0.5), SpeedSegment(12, 16, 0.8, 1)])
-        self.app._video_select(2, 5, 0)
-        self.assertEqual(float(self.app.video_speed.get()), 2)
-        self.assertEqual(float(self.app.video_ramp.get()), 0.5)
-        self.app.video_speed.set("0.75")
-        self.app.video_ramp.set("0.25")
-        self.app.apply_video_segment()
-        expected = [SpeedSegment(2, 5, 0.75, 0.25), SpeedSegment(12, 16, 0.8, 1)]
-        self.assertEqual(self.app.video_segments, expected)
-        self.assertEqual(self.app.video_timeline.segments, expected)
-        self.assertEqual(list(self.app.video_preview.set_segments.call_args.args[0]), expected)
-        self.app.delete_video_segment()
-        self.assertEqual(self.app.video_segments, expected[1:])
-        self.assertEqual(self.app.video_timeline.segments, expected[1:])
-        self.assertEqual(list(self.app.video_preview.set_segments.call_args.args[0]), expected[1:])
-
-    def test_video_speed_edits_preserve_exact_adjacent_fractional_boundaries(self):
-        boundary, duration = 1 / 3, 2 / 3
-        self._load_video(duration=duration)
-        first = SpeedSegment(0, boundary, speed=1, ramp_seconds=0)
-        second = SpeedSegment(boundary, duration, speed=0.8, ramp_seconds=0)
-        self.app._video_segments_changed([first, second], 1)
-        self.app._video_select(boundary, duration, 1)
-
-        with patch("apps.v3turbo_desktop.messagebox.showerror") as error:
-            self.app._video_speed_drag("2.0")
-        error.assert_not_called()
-        self.assertEqual(self.app.video_segments[0], first)
-        self.assertEqual(self.app.video_segments[1], SpeedSegment(boundary, duration, 2, 0))
-
-        self.app.video_speed.set("1.25")
-        self.app.apply_video_segment()
-        expected = [first, SpeedSegment(boundary, duration, 1.25, 0)]
-        self.assertEqual(self.app.video_segments, expected)
-        self.assertEqual(self.app.video_timeline.segments, expected)
-        self.assertEqual(list(self.app.video_preview.set_segments.call_args.args[0]), expected)
-
-    def test_video_segments_reject_overlap_and_bounds_without_changing_applied_plan(self):
-        self._load_video(duration=20)
-        self._add_segment(2, 5)
-        expected = list(self.app.video_segments)
-        for start, end in ((4, 7), (-1, 1), (17, 21), (9, 9)):
-            self.app.video_start.set(str(start))
-            self.app.video_end.set(str(end))
-            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
-                self.app.add_video_segment()
-            self.assertEqual(self.app.video_segments, expected)
-            self.assertEqual(self.app.video_timeline.segments, expected)
-
-    def test_video_timeline_callbacks_apply_drag_and_seek_the_embedded_preview(self):
-        self._load_video(duration=20)
-        self._add_segment(2, 5, speed=0.8)
-        self._add_segment(10, 14, speed=2)
-        moved = [SpeedSegment(4, 8, speed=0.8), SpeedSegment(10, 14, speed=2)]
-        self.app._video_segments_changed(moved, 0)
-        self.assertEqual(self.app.video_segments, moved)
-        self.assertEqual(self.app.video_selected, 0)
-        self.assertEqual(float(self.app.video_start.get()), 4)
-        self.assertEqual(float(self.app.video_end.get()), 8)
-        self.assertEqual(list(self.app.video_preview.set_segments.call_args.args[0]), moved)
-        self.app._video_seek(11.5)
-        self.app.video_preview.seek.assert_called_with(11.5)
-        self.assertEqual(self.app.video_timeline.position, 11.5)
-        self.app._video_select(16, 18, None)
-        self.assertIsNone(self.app.video_selected)
-        self.assertEqual(float(self.app.video_start.get()), 16)
-        self.assertEqual(float(self.app.video_end.get()), 18)
-        self.assertEqual(self.app.video_segments, moved)
-
-    def test_video_export_uses_a_snapshot_and_ignores_unapplied_draft_edits(self):
-        source = self._load_video()
-        self._add_segment(2, 5, speed=2)
-        expected = tuple(self.app.video_segments)
-        self.app.video_speed.set("unapplied invalid draft")
-        result = self.destination / "video_000000000006.mp4"
-        with patch.object(self.app, "_job") as job:
-            self.app.export_video()
-        work = job.call_args.args[0]
-        self.app.video_segments.clear()
-        with patch.object(self.tool, "edit_video_segments", return_value=(result, "Finished")) as render:
-            work()
-        self.assertEqual(render.call_args.args, (str(source), expected))
-
-    def test_video_export_requires_an_applied_segment_before_starting_a_job(self):
-        self._load_video()
-        with patch.object(self.app, "_job") as job:
-            with self.assertRaises(ValueError):
-                self.app.export_video()
-        job.assert_not_called()
-
-    def test_changing_video_path_discards_the_old_plan_and_unloads_preview(self):
-        source = self._load_video()
-        self._add_segment(2, 5)
-        self.app.video_preview.unload.reset_mock()
-        self.app.video_path.set(str(self.folder / "another video.mp4"))
-        self.app.video_preview.unload.assert_called_once()
-        self.assertEqual(self.app.video_duration, 0)
-        self.assertEqual(self.app.video_segments, [])
-        self.assertIsNone(self.app.video_selected)
-        self.assertEqual(self.app.video_timeline.duration, 0)
-        self.assertEqual(self.app.video_segment_list.get_children(), ())
-        self.assertIn("disabled", self.app.video_play_button.state())
-        self.assertEqual(source.read_bytes(), b"input video")
-
-    def test_busy_export_blocks_plan_changes_and_opening_another_reader(self):
-        self._load_video()
-        self._add_segment(2, 5)
-        expected = list(self.app.video_segments)
-        self.app.busy = True
-        try:
-            for action in (self.app.add_video_segment, self.app.apply_video_segment,
-                           self.app.delete_video_segment, self.app.clear_video_segments,
-                           self.app.inspect_video, self.app.toggle_video_play):
-                with self.subTest(action=action.__name__), self.assertRaises(RuntimeError):
-                    action()
-                self.assertEqual(self.app.video_segments, expected)
-        finally:
-            self.app.busy = False
-        self.app.video_preview.open.assert_not_called()
 
     def test_generated_video_history_can_save_open_and_delete_without_touching_input(self):
         video = self.destination / "video_000000000006.mp4"
@@ -552,7 +496,7 @@ class DesktopUITests(unittest.TestCase):
         self.root = tk.Tk()
         self.root.withdraw()
         self.tool = TurboTool(settings_path=self.settings)
-        self.app = DesktopApp(self.root, self.tool)
+        self.app = DesktopApp(self.root, self.tool, autoload=False)
         self.root.update_idletasks()
         self.assertEqual(self.tool.output_dir, second)
         self.assertEqual(self.tool.voices_path, self.library)
@@ -626,33 +570,6 @@ class DesktopUITests(unittest.TestCase):
                 self.assertTrue(self.speech.exists())
         self.app.busy, self.app.recorder = False, None
 
-    def test_video_viewer_playback_and_timeline_fit_the_tab_when_resized(self):
-        self.root.attributes("-alpha", 0.0)
-        self.root.deiconify()
-        self._wait_for_window()
-        self.app.nav_buttons["Video"].invoke()
-        self._wait_for_page("Video")
-        tab = self.app.pages["Video"]
-        widgets = (self.app.video_preview.master, self.app.video_preview,
-                   self.app.video_preview.canvas, self.app.video_timeline,
-                   self.app.video_play_button)
-        for width, height in ((980, 620), (1280, 850)):
-            self.root.geometry(f"{width}x{height}")
-            self._pump_until(lambda: self.root.winfo_width() == width and self.root.winfo_height() == height)
-            left, top = tab.winfo_rootx(), tab.winfo_rooty()
-            right, bottom = left + tab.winfo_width(), top + tab.winfo_height()
-            for widget in widgets:
-                with self.subTest(size=(width, height), widget=type(widget).__name__):
-                    self._pump_until(lambda: widget.winfo_ismapped() and widget.winfo_viewable(), widget)
-                    self.assertTrue(widget.winfo_ismapped(), self._layout_diagnostics(widget))
-                    self.assertGreater(widget.winfo_width(), 5)
-                    self.assertGreater(widget.winfo_height(), 5)
-                    self.assertGreaterEqual(widget.winfo_rootx(), left)
-                    self.assertGreaterEqual(widget.winfo_rooty(), top)
-                    self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(), right)
-                    self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(), bottom)
-            self.assertGreaterEqual(self.app.video_preview.canvas.winfo_height(), 50)
-            self.assertGreaterEqual(self.app.video_timeline.winfo_height(), 70)
 
     def test_navigation_and_primary_actions_remain_accessible_when_resized(self):
         # Map an invisible window so Tk computes real geometry without showing UI.
@@ -679,12 +596,14 @@ class DesktopUITests(unittest.TestCase):
                         self.assertGreater(delete.winfo_height(), 5)
                         self.assertLessEqual(delete.winfo_rooty() + delete.winfo_height(),
                                              self.app.book.winfo_rooty() + self.app.book.winfo_height())
-            for title, action in (("Văn bản", "Chạy hàng đợi"), ("Video", "Xuất video")):
+            for title in ("Văn bản", "SRT"):
+                action = "Chạy hàng đợi"
                 with self.subTest(size=(width, height), primary_action=action):
                     self.app.nav_buttons[title].invoke()
                     self._wait_for_page(title)
                     generate = next(button for button in self.app.action_buttons
-                                    if str(button.cget("text")) == action)
+                                    if str(button.cget("text")) == action
+                                    and str(button).startswith(str(self.app.pages[title]) + "."))
                     self._pump_until(lambda: generate.winfo_ismapped() and generate.winfo_viewable(), generate)
                     self.assertTrue(generate.winfo_ismapped(), self._layout_diagnostics(generate))
                     self.assertGreater(generate.winfo_height(), 5)
@@ -692,6 +611,11 @@ class DesktopUITests(unittest.TestCase):
                                          self.app.book.winfo_rooty() + self.app.book.winfo_height())
             self.app.nav_buttons["Cấu hình"].invoke()
             self._wait_for_page("Cấu hình")
+            self.app.show_model_options.set(True)
+            self.app._toggle_options(self.app.model_options_panel, self.app.show_model_options)
+            self.app.show_sampling_options.set(True)
+            self.app._toggle_options(self.app.sampling_options_panel, self.app.show_sampling_options)
+            self.root.update_idletasks()
             canvas = next(child for child in self.app.pages["Cấu hình"].winfo_children()
                           if isinstance(child, tk.Canvas))
             self.assertGreater(float(canvas.cget("scrollregion").split()[3]), canvas.winfo_height())

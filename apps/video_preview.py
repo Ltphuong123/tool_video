@@ -18,13 +18,11 @@ import numpy as np
 
 def _open_clip(path):
     # Keep MoviePy and Pillow optional until a video is actually opened.
-    from apps.video_editor import _guard_reader_cleanup, require_moviepy
+    from apps.video_editor import require_moviepy
+    require_moviepy()
+    from apps.video_preview_reader import PreviewVideoReader
 
-    VideoFileClip, _, _ = require_moviepy()
-    clip = VideoFileClip(str(path), audio=False, target_resolution=(None, 540),
-                         resize_algorithm="bilinear")
-    _guard_reader_cleanup(clip)
-    return clip
+    return PreviewVideoReader(str(path), target_resolution=(None, 540), resize_algo="bilinear")
 
 
 def _clip_info(clip):

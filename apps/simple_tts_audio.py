@@ -1,4 +1,4 @@
-"""Rubber Band and lightweight voice effects for the separate desktop app."""
+"""Rubber Band tempo adjustment for the separate desktop app."""
 from dataclasses import asdict, dataclass
 import json
 import math
@@ -15,9 +15,6 @@ TEMPO = {"Không đổi tốc độ": "none", "Rubber Band chất lượng cao":
 class AudioOptions:
     tempo: str = "none"
     speed: float = 1.0
-    bright: bool = False
-    compress: bool = False
-    peak_guard: bool = False
 
     def validate(self):
         if self.tempo not in TEMPO.values():
@@ -45,21 +42,7 @@ def pedalboard_module():
         raise RuntimeError("Chưa có Pedalboard. Chạy: uv pip install --python .venv/Scripts/python.exe -r requirements-simple-tts-audio.txt") from exc
 
 
-def build_effect_chain(options):
-    """Build once per job; reset the same effects before each independent cue."""
-    if not (options.bright or options.compress):
-        return None
-    pb = pedalboard_module()
-    effects = []
-    if options.bright:
-        effects.extend([pb.HighpassFilter(cutoff_frequency_hz=65),
-                        pb.HighShelfFilter(cutoff_frequency_hz=3500, gain_db=1.5, q=0.707)])
-    if options.compress:
-        effects.append(pb.Compressor(threshold_db=-18, ratio=2, attack_ms=15, release_ms=120))
-    return pb.Pedalboard(effects)
-
-
-def process_audio(audio, rate, options, *, effects_chain=None):
+def process_audio(audio, rate, options):
     options.validate()
     audio = mono(audio)
     # No copy or engine setup for bypass. All processing keeps source untouched.
@@ -67,16 +50,7 @@ def process_audio(audio, rate, options, *, effects_chain=None):
         audio = pedalboard_module().time_stretch(
             audio, rate, stretch_factor=options.speed, pitch_shift_in_semitones=0,
             high_quality=True, retain_phase_continuity=True)
-    if options.bright or options.compress:
-        chain = effects_chain if effects_chain is not None else build_effect_chain(options)
-        audio = chain.process(audio, rate, reset=True)
-    if options.speed != 1 or options.bright or options.compress:
         audio = mono(audio)
-    if options.peak_guard:
-        peak = float(np.max(np.abs(audio)))
-        ceiling = 10 ** (-1 / 20)
-        if peak > ceiling:
-            audio = audio * (ceiling / peak)
     return audio, rate
 
 
